@@ -8,7 +8,8 @@ Two passes:
      At extract time, LLM determines which real candidate each item is about.
 
 Source types:
-  reddit        - unauthenticated JSON via old.reddit.com + browser UA
+  reddit        - authenticated Reddit API via PRAW when credentials are present;
+                  fallback to old.reddit.com JSON for local/dev
   trends        - Google Trends via pytrends
   general_feed  - RSS from broad culture/fitness publications
   rss / news    - legacy, still works
@@ -22,6 +23,7 @@ import sqlite3
 import argparse
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,10 +38,12 @@ BROWSER_UA = (
 USER_AGENT = os.environ.get("SWELL_USER_AGENT", BROWSER_UA)
 
 REDDIT_RATE_LIMIT_SECONDS = 3.0
+REDDIT_LIMIT = int(os.environ.get("SWELL_REDDIT_LIMIT", "40"))
 DEDUP_HOURS = 6
 MAX_FETCH_BYTES = 500_000
 
 GENERAL_CANDIDATE_SLUG = "__general__"
+_REDDIT_CLIENT = None
 
 
 def load_sources():
@@ -62,7 +66,88 @@ def ensure_general_candidate(db):
     return cur.lastrowid
 
 
-def fetch_reddit(url: str) -> str:
+def reddit_credentials_present() -> bool:
+    return bool(
+        os.environ.get("SWELL_REDDIT_CLIENT_ID") or os.environ.get("REDDIT_CLIENT_ID")
+    ) and bool(
+        os.environ.get("SWELL_REDDIT_CLIENT_SECRET") or os.environ.get("REDDIT_CLIENT_SECRET")
+    )
+
+
+def reddit_client():
+    global _REDDIT_CLIENT
+    if _REDDIT_CLIENT is not None:
+        return _REDDIT_CLIENT
+
+    try:
+        import praw
+    except ImportError as exc:
+        raise RuntimeError("praw not installed; install requirements.txt") from exc
+
+    client_id = os.environ.get("SWELL_REDDIT_CLIENT_ID") or os.environ.get("REDDIT_CLIENT_ID")
+    client_secret = os.environ.get("SWELL_REDDIT_CLIENT_SECRET") or os.environ.get("REDDIT_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise RuntimeError("missing SWELL_REDDIT_CLIENT_ID/SWELL_REDDIT_CLIENT_SECRET")
+
+    user_agent = os.environ.get("SWELL_REDDIT_USER_AGENT") or "swell-checker/0.1:trend-radar"
+    _REDDIT_CLIENT = praw.Reddit(
+        client_id=client_id,
+        client_secret=client_secret,
+        user_agent=user_agent,
+    )
+    _REDDIT_CLIENT.read_only = True
+    return _REDDIT_CLIENT
+
+
+def parse_reddit_source(url: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlparse(url)
+    parts = [p for p in parsed.path.split("/") if p and p != ".json"]
+    if len(parts) < 2 or parts[0].lower() != "r":
+        raise ValueError(f"unsupported reddit source url: {url}")
+    subreddit = parts[1]
+    sort = "hot"
+    if len(parts) >= 3:
+        sort = parts[2].replace(".json", "").lower()
+    if sort not in {"hot", "new", "top", "rising"}:
+        sort = "hot"
+    return subreddit, sort
+
+
+def fetch_reddit_praw(url: str) -> str:
+    subreddit_name, sort = parse_reddit_source(url)
+    reddit = reddit_client()
+    subreddit = reddit.subreddit(subreddit_name)
+    listing = {
+        "hot": subreddit.hot,
+        "new": subreddit.new,
+        "top": subreddit.top,
+        "rising": subreddit.rising,
+    }[sort]
+
+    out = [f"SUBREDDIT: r/{subreddit_name}", f"SORT: {sort}", "---"]
+    for post in listing(limit=REDDIT_LIMIT):
+        out.append(f"TITLE: {getattr(post, 'title', '')}")
+        selftext = getattr(post, "selftext", "") or ""
+        if selftext:
+            out.append(f"BODY: {selftext[:2000]}")
+        created_utc = getattr(post, "created_utc", 0) or 0
+        out.append(
+            f"SCORE: {getattr(post, 'score', 0)}  "
+            f"COMMENTS: {getattr(post, 'num_comments', 0)}  "
+            f"UPVOTE_RATIO: {getattr(post, 'upvote_ratio', 0)}"
+        )
+        out.append(
+            f"AUTHOR: {getattr(getattr(post, 'author', None), 'name', '[deleted]')}  "
+            f"CREATED: {datetime.utcfromtimestamp(created_utc).isoformat()}"
+        )
+        permalink = getattr(post, "permalink", "")
+        if permalink:
+            out.append(f"URL: https://www.reddit.com{permalink}")
+        out.append("---")
+    return "\n".join(out)[:MAX_FETCH_BYTES]
+
+
+def fetch_reddit_anon(url: str) -> str:
     # Force old.reddit.com - cleaner anti-bot
     url = url.replace("www.reddit.com", "old.reddit.com").replace("://reddit.com", "://old.reddit.com")
     if "old.old.reddit.com" in url:
@@ -87,6 +172,12 @@ def fetch_reddit(url: str) -> str:
     except (KeyError, TypeError) as e:
         return f"[parse error: {e}]"
     return "\n".join(out)[:MAX_FETCH_BYTES]
+
+
+def fetch_reddit(url: str) -> str:
+    if reddit_credentials_present():
+        return fetch_reddit_praw(url)
+    return fetch_reddit_anon(url)
 
 
 def fetch_rss(url: str) -> str:

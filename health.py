@@ -44,6 +44,20 @@ def main():
         sys.exit(3)
 
     print(f"ok   round-trip prompt succeeded")
+
+    reddit_id = os.environ.get("SWELL_REDDIT_CLIENT_ID") or os.environ.get("REDDIT_CLIENT_ID")
+    reddit_secret = os.environ.get("SWELL_REDDIT_CLIENT_SECRET") or os.environ.get("REDDIT_CLIENT_SECRET")
+    if reddit_id and reddit_secret:
+        try:
+            import praw  # noqa: F401
+        except ImportError:
+            print("FAIL: Reddit credentials are set but praw is not installed", file=sys.stderr)
+            sys.exit(3)
+        print("ok   Reddit API credentials present")
+    else:
+        print("WARN Reddit API credentials missing; reddit ingest will use fragile anonymous fallback",
+              file=sys.stderr)
+
     print("\nhealth: all checks passed")
 
 
