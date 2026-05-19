@@ -18,6 +18,7 @@ DB = os.path.join(HERE, "db.sqlite")
 
 sys.path.insert(0, HERE)
 from scorer import load_config
+from calibration import evaluate_calibration
 
 
 ROUTABLE_STAGES = {"approaching", "very_early"}
@@ -204,12 +205,25 @@ def update_route_status(db, route_id, status):
     return 0
 
 
+def calibration_allows_routing(db, cfg, as_of):
+    results, failures = evaluate_calibration(db, as_of, cfg, min_events=1)
+    if not failures:
+        return True
+    print("trend_router: calibration failed; refusing to emit assistant actions", file=sys.stderr)
+    for failure in failures:
+        print(f"  - {failure}", file=sys.stderr)
+    print("Run: python3 calibration.py --diagnose", file=sys.stderr)
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=DB, help="SQLite db path")
     ap.add_argument("--as-of", default=None, help="Route a specific score date YYYY-MM-DD")
     ap.add_argument("--emit", action="store_true", help="Write pending router_events")
     ap.add_argument("--notify", action="store_true", help="Send routed events to Telegram")
+    ap.add_argument("--skip-calibration", action="store_true",
+                    help="Allow --emit even when calibration fails")
     ap.add_argument("--list-pending", action="store_true", help="List pending router approvals")
     ap.add_argument("--approve", type=int, default=None, help="Mark one router_event id approved")
     ap.add_argument("--reject", type=int, default=None, help="Mark one router_event id rejected")
@@ -234,6 +248,10 @@ def main():
         return update_route_status(db, args.approve, "approved")
     if args.reject is not None:
         return update_route_status(db, args.reject, "rejected")
+
+    route_as_of = datetime.strptime(args.as_of, "%Y-%m-%d") if args.as_of else datetime.utcnow()
+    if args.emit and not args.skip_calibration and not calibration_allows_routing(db, cfg, route_as_of):
+        return 2
 
     routed = []
     for row in latest_score_rows(db, args.as_of):

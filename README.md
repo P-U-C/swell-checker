@@ -86,9 +86,9 @@ All times UTC:
 - **12:45 daily** — health check (auth + CLI verification)
 - **Monday 14:00 UTC** — weekly watchlist → Telegram
 
-`run.sh` executes the live loop: ingest → extract → score snapshot → route pending
-assistant actions → status. With `--watchlist`, it also sends the digest and router
-summary to Telegram.
+`run.sh` executes the live loop: ingest → extract → score snapshot → calibration
+gate → route pending assistant actions → status. With `--watchlist`, it also
+sends the digest and router summary to Telegram.
 
 Install the current per-user schedule with:
 
@@ -117,7 +117,7 @@ The first assistant layer is intentionally conservative:
 
 1. `scorer.py` writes a score snapshot.
 2. `calibration.py` verifies known positives and negatives still separate.
-3. `trend_router.py --emit` creates rows in `router_events` for fired, routable trends.
+3. `trend_router.py --emit` creates rows in `router_events` for fired, routable trends only if calibration passes.
 4. Router events start as `pending_approval`; downstream playbooks should not execute until approved.
 
 Initial routing:

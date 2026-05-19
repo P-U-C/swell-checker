@@ -15,6 +15,7 @@ PYTHON="${PYTHON:-python3}"
 "$PYTHON" ingest.py
 "$PYTHON" extract.py --limit 50
 "$PYTHON" scorer.py
+"$PYTHON" calibration.py --diagnose
 "$PYTHON" trend_router.py --emit
 
 if [[ "${1:-}" == "--watchlist" ]]; then
