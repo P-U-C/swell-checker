@@ -10,12 +10,16 @@ if [[ -f .env ]]; then
     set -a && . ./.env && set +a
 fi
 
-python3 ingest.py
-python3 extract.py --limit 50
-python3 scorer.py --snapshot
+PYTHON="${PYTHON:-python3}"
+
+"$PYTHON" ingest.py
+"$PYTHON" extract.py --limit 50
+"$PYTHON" scorer.py
+"$PYTHON" trend_router.py --emit
 
 if [[ "${1:-}" == "--watchlist" ]]; then
-    python3 watchlist.py --snapshot | python3 notify.py stdin
+    "$PYTHON" watchlist.py --snapshot | "$PYTHON" notify.py stdin
+    "$PYTHON" trend_router.py --emit --notify
 fi
 
-python3 status.py
+"$PYTHON" status.py

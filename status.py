@@ -15,6 +15,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(HERE, "db.sqlite")
 
 
+def table_exists(db, name):
+    return db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone() is not None
+
+
 def summary(db):
     print("== swell-checker status ==")
     n_cand = db.execute("SELECT COUNT(*) FROM candidates WHERE status='tracking'").fetchone()[0]
@@ -29,6 +36,12 @@ def summary(db):
     print(f"fetches:     {n_fetch} total, {n_unproc} unprocessed")
     print(f"events:      {n_events} total")
     print(f"scores:      {n_scores} snapshots")
+    if table_exists(db, "router_events"):
+        n_router = db.execute("SELECT COUNT(*) FROM router_events").fetchone()[0]
+        n_pending = db.execute(
+            "SELECT COUNT(*) FROM router_events WHERE route_status='pending_approval'"
+        ).fetchone()[0]
+        print(f"router:      {n_router} events, {n_pending} pending approval")
 
 
 def per_candidate(db):
@@ -59,10 +72,11 @@ def per_source(db):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--db", default=DB, help="SQLite db path")
     ap.add_argument("--candidates", action="store_true")
     ap.add_argument("--sources", action="store_true")
     args = ap.parse_args()
-    db = sqlite3.connect(DB)
+    db = sqlite3.connect(args.db)
     if args.candidates:
         per_candidate(db)
     elif args.sources:

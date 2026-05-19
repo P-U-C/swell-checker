@@ -5,9 +5,9 @@ trends, extracts typed events from Reddit/RSS/News, scores them on a three-signa
 growth model (velocity + spread + vocabulary), emits a weekly watchlist to Telegram.
 
 **Current scope (v0):**
-- Curated candidate list (22 trends, edit `candidates.yaml`)
+- Curated candidate list (23 trends, edit `candidates.yaml`)
 - Physical/lifestyle trends only
-- Weekly Telegram watchlist digest
+- Weekly Telegram watchlist digest plus pending assistant action intents
 - Shared VM + Telegram bot with peptide-corpus; distinguished by 🌊 prefix
 
 **Deliberately deferred to Phase 2:**
@@ -28,13 +28,15 @@ swell-checker/
 ├── ingest.py            # Fetch all sources on cron (Reddit JSON, RSS, Trends)
 ├── extract.py           # Events from fetches via Sonnet
 ├── scorer.py            # Compute composite scores (velocity + spread + vocabulary)
+├── calibration.py       # Guardrail checks for known high/low calibration candidates
+├── trend_router.py      # Convert fired scores into pending assistant action intents
 ├── watchlist.py         # Weekly ranked digest
 ├── notify.py            # Telegram (shared bot with peptide-corpus, 🌊 prefix)
 ├── status.py            # Corpus health check
 ├── health.py            # Auth + CLI verification
 ├── cron-wrap.sh         # Cron wrapper with Telegram alerts on failure
+├── crontab.example      # Per-user cron schedule for the assistant loop
 ├── run.sh               # Single-command entrypoint
-├── setup.sh             # One-shot VM setup (run as root)
 └── prompts/extract.md
 ```
 
@@ -66,20 +68,33 @@ sudo chmod 600 /home/swell/swell-checker/.env
 # 5. First test run
 sudo -iu swell
 cd swell-checker
-python3 ingest.py --limit 3      # test 3 candidates
-python3 extract.py --limit 5
-python3 scorer.py
-python3 watchlist.py             # preview Monday's digest
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python ingest.py --limit 3      # test 3 candidates
+.venv/bin/python extract.py --limit 5
+.venv/bin/python scorer.py               # writes/upserts today's score snapshots
+.venv/bin/python calibration.py --warn-only
+.venv/bin/python trend_router.py          # dry-run pending assistant actions
+.venv/bin/python watchlist.py             # preview Monday's digest
 ```
 
-## Cron schedule (auto-installed)
+## Cron schedule
 
-All times UTC, offset from peptide-corpus to spread load on the sub:
+All times UTC:
 
-- **:30 every 6h** — ingest (fetches all tracked candidates' sources)
-- **:45 every 6h** — extract (parses fetches into typed events)
+- **:30 every 6h** — full assistant loop via `run.sh`
 - **12:45 daily** — health check (auth + CLI verification)
 - **Monday 14:00 UTC** — weekly watchlist → Telegram
+
+`run.sh` executes the live loop: ingest → extract → score snapshot → route pending
+assistant actions → status. With `--watchlist`, it also sends the digest and router
+summary to Telegram.
+
+Install the current per-user schedule with:
+
+```bash
+crontab crontab.example
+```
 
 ## Scoring logic (quick reference)
 
@@ -92,6 +107,26 @@ All times UTC, offset from peptide-corpus to spread load on the sub:
 **Composite** = 0.4·velocity + 0.4·spread + 0.2·vocabulary, damped by disruption penalty.
 
 Fires at composite ≥ 0.55. Edit `scorer_config.yaml` to tune.
+
+`python3 scorer.py` writes/upserts score snapshots by default. Use
+`python3 scorer.py --dry-run` for a non-persisting preview.
+
+## Assistant router
+
+The first assistant layer is intentionally conservative:
+
+1. `scorer.py` writes a score snapshot.
+2. `calibration.py` verifies known positives and negatives still separate.
+3. `trend_router.py --emit` creates rows in `router_events` for fired, routable trends.
+4. Router events start as `pending_approval`; downstream playbooks should not execute until approved.
+
+Initial routing:
+
+| Candidate stage | Fired? | Playbook |
+|---|---:|---|
+| `approaching` | yes | `business_guy.ig_niche` |
+| `very_early` | yes | `operator.research_brief` |
+| `calibration` / `calibration_fizzled` | any | ignored |
 
 ## Calibration period (first 4 weeks)
 

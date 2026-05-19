@@ -1,0 +1,16 @@
+SHELL=/bin/bash
+HOME=/home/swell
+PATH=/usr/local/bin:/usr/bin:/bin
+PYTHON=/home/swell/swell-checker/.venv/bin/python
+
+# Install with:
+#   crontab crontab.example
+
+# Every 6h: refresh corpus, score, and emit new pending router events.
+30 */6 * * * cd /home/swell/swell-checker && ./cron-wrap.sh run ./run.sh >> /var/log/swell-run.log 2>&1
+
+# Daily: verify Claude auth and runtime assumptions.
+45 12 * * * cd /home/swell/swell-checker && ./cron-wrap.sh health ./health.py >> /var/log/swell-health.log 2>&1
+
+# Weekly: send watchlist and any new router events to Telegram.
+0 14 * * 1 cd /home/swell/swell-checker && ./cron-wrap.sh weekly ./run.sh --watchlist >> /var/log/swell-watchlist.log 2>&1

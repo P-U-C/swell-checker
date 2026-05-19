@@ -8,7 +8,7 @@ Same three-signal architecture as the backtest scorer:
   - vocabulary (positive/negative vocabulary events, all-time)
   - disruption penalty (damping)
 
-Reads events from the db, writes snapshots to the scores table.
+Reads events from the db, writes/upserts snapshots to the scores table.
 """
 import os
 import sys
@@ -112,40 +112,62 @@ def score_candidate(db, candidate_id, as_of, cfg):
     }
 
 
+def write_score_snapshot(db, candidate_id, as_of, score):
+    """Upsert one score snapshot for a candidate/date."""
+    db.execute(
+        """INSERT INTO scores
+           (candidate_id, as_of, velocity, spread, vocabulary, composite, would_fire)
+           VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(candidate_id, as_of) DO UPDATE SET
+             velocity=excluded.velocity,
+             spread=excluded.spread,
+             vocabulary=excluded.vocabulary,
+             composite=excluded.composite,
+             would_fire=excluded.would_fire,
+             created_at=CURRENT_TIMESTAMP""",
+        (
+            candidate_id, as_of.strftime("%Y-%m-%d"),
+            score["velocity"], score["spread"], score["vocabulary"],
+            score["composite"], 1 if score["would_fire"] else 0,
+        ),
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--as-of", default=None, help="Date YYYY-MM-DD (default today)")
-    ap.add_argument("--snapshot", action="store_true", help="Write scores to db")
+    ap.add_argument("--db", default=DB, help="SQLite db path")
+    ap.add_argument("--dry-run", action="store_true", help="Print scores without writing snapshots")
+    ap.add_argument("--snapshot", action="store_true", help="Deprecated: snapshots are written by default")
     args = ap.parse_args()
+    if args.dry_run and args.snapshot:
+        ap.error("--dry-run and --snapshot cannot be used together")
 
     as_of = datetime.strptime(args.as_of, "%Y-%m-%d") if args.as_of else datetime.utcnow()
     cfg = load_config()
-    db = sqlite3.connect(DB)
+    db = sqlite3.connect(args.db)
+    write_snapshot = not args.dry_run
 
     candidates = db.execute(
         "SELECT id, slug, display_name FROM candidates WHERE status='tracking' AND slug != '__general__' ORDER BY display_name"
     ).fetchall()
 
     print(f"{'candidate':<40s} {'vel':>6} {'spr':>6} {'voc':>6} {'comp':>6}  fire?")
+    written = 0
     for cid, slug, name in candidates:
         s = score_candidate(db, cid, as_of, cfg)
         fire = "YES" if s["would_fire"] else "-"
         print(f"{name:<40s} {s['velocity']:>6.2f} {s['spread']:>6.2f} {s['vocabulary']:>6.2f} "
               f"{s['composite']:>6.3f}  {fire}")
-        if args.snapshot:
-            try:
-                db.execute(
-                    """INSERT INTO scores
-                       (candidate_id, as_of, velocity, spread, vocabulary, composite, would_fire)
-                       VALUES (?,?,?,?,?,?,?)""",
-                    (cid, as_of.strftime("%Y-%m-%d"),
-                     s["velocity"], s["spread"], s["vocabulary"],
-                     s["composite"], 1 if s["would_fire"] else 0),
-                )
-                db.commit()
-            except sqlite3.IntegrityError:
-                # Already scored for this date
-                pass
+        if write_snapshot:
+            write_score_snapshot(db, cid, as_of, s)
+            written += 1
+
+    if write_snapshot:
+        db.commit()
+        print(f"\nsnapshot upserted: {written} rows for {as_of.strftime('%Y-%m-%d')}")
+    else:
+        print("\ndry run: no score rows written")
 
 
 if __name__ == "__main__":

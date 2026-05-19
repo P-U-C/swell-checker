@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS candidates (
     slug TEXT UNIQUE NOT NULL,            -- e.g. "padel_us"
     display_name TEXT NOT NULL,           -- e.g. "Padel (US)"
     category TEXT NOT NULL,               -- e.g. "racquet_sport"
+    stage TEXT DEFAULT 'uncalibrated',     -- approaching | very_early | calibration | calibration_fizzled
     status TEXT DEFAULT 'tracking',       -- tracking | paused | promoted | dropped
     notes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -70,3 +71,20 @@ CREATE TABLE IF NOT EXISTS scores (
     UNIQUE(candidate_id, as_of)
 );
 CREATE INDEX IF NOT EXISTS scores_candidate_idx ON scores(candidate_id, as_of);
+
+-- Assistant/router events: fired scores converted into downstream action intents.
+CREATE TABLE IF NOT EXISTS router_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+    as_of DATE NOT NULL,
+    candidate_slug TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    stage TEXT,
+    composite REAL NOT NULL,
+    playbook TEXT NOT NULL,
+    route_status TEXT DEFAULT 'pending_approval', -- pending_approval | approved | rejected | executed
+    payload_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(candidate_id, as_of, playbook)
+);
+CREATE INDEX IF NOT EXISTS router_events_status_idx ON router_events(route_status, created_at);

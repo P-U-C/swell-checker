@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(HERE, "db.sqlite")
 
 sys.path.insert(0, HERE)
-from scorer import score_candidate, load_config
+from scorer import score_candidate, load_config, write_score_snapshot
 
 
 def main():
@@ -63,18 +63,10 @@ def main():
         })
 
         if args.snapshot:
-            try:
-                db.execute(
-                    """INSERT INTO scores
-                       (candidate_id, as_of, velocity, spread, vocabulary, composite, would_fire)
-                       VALUES (?,?,?,?,?,?,?)""",
-                    (cid, today.strftime("%Y-%m-%d"),
-                     s["velocity"], s["spread"], s["vocabulary"],
-                     s["composite"], 1 if s["would_fire"] else 0),
-                )
-                db.commit()
-            except sqlite3.IntegrityError:
-                pass
+            write_score_snapshot(db, cid, today, s)
+
+    if args.snapshot:
+        db.commit()
 
     # Rank by composite descending
     rows.sort(key=lambda r: -r["score"]["composite"])
