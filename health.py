@@ -51,12 +51,12 @@ def main():
         try:
             import praw  # noqa: F401
         except ImportError:
-            print("FAIL: Reddit credentials are set but praw is not installed", file=sys.stderr)
+            print("FAIL: Reddit credentials are set but praw is not installed; run: pip install praw",
+                  file=sys.stderr)
             sys.exit(3)
         print("ok   Reddit API credentials present")
     else:
-        print("WARN Reddit API credentials missing; reddit ingest will use fragile anonymous fallback",
-              file=sys.stderr)
+        print("ok   Reddit API credentials absent; using requests-based public JSON fetch")
 
     print("\nhealth: all checks passed")
 

@@ -8,8 +8,8 @@ Two passes:
      At extract time, LLM determines which real candidate each item is about.
 
 Source types:
-  reddit        - authenticated Reddit API via PRAW when credentials are present;
-                  fallback to old.reddit.com JSON for local/dev
+  reddit        - public old.reddit.com JSON via requests; optional PRAW when
+                  Reddit API credentials are present
   trends        - Google Trends via pytrends
   general_feed  - RSS from broad culture/fitness publications
   rss / news    - legacy, still works
@@ -19,10 +19,9 @@ import sys
 import time
 import json
 import yaml
+import requests
 import sqlite3
 import argparse
-import urllib.request
-import urllib.error
 import urllib.parse
 from datetime import datetime, timedelta
 
@@ -152,13 +151,13 @@ def fetch_reddit_anon(url: str) -> str:
     url = url.replace("www.reddit.com", "old.reddit.com").replace("://reddit.com", "://old.reddit.com")
     if "old.old.reddit.com" in url:
         url = url.replace("old.old.reddit.com", "old.reddit.com")
-    req = urllib.request.Request(url, headers={
+    resp = requests.get(url, headers={
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
         "Accept-Language": "en-US,en;q=0.9",
-    })
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.load(resp)
+    }, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
     out = []
     try:
         for post in data.get("data", {}).get("children", []):
@@ -181,9 +180,12 @@ def fetch_reddit(url: str) -> str:
 
 
 def fetch_rss(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
+    resp = requests.get(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/rss+xml, application/atom+xml, text/xml, */*",
+    }, timeout=30)
+    resp.raise_for_status()
+    raw = resp.text
     import re
     items = re.findall(r"<item[^>]*>(.*?)</item>", raw, re.DOTALL | re.IGNORECASE)[:40]
     if not items:
@@ -365,12 +367,14 @@ def main():
                 db.commit()
                 total += 1
                 print(f"  ok  {slug:30s} [{src['type']:12s}] ({len(text)}ch) {src.get('label','')}")
-            except urllib.error.HTTPError as e:
+            except requests.HTTPError as e:
                 failed += 1
+                status = e.response.status_code if e.response is not None else "?"
+                reason = e.response.reason if e.response is not None else str(e)
                 db.execute("UPDATE sources SET last_error=? WHERE id=?",
-                           (f"HTTP {e.code}: {e.reason}", source_id))
+                           (f"HTTP {status}: {reason}", source_id))
                 db.commit()
-                print(f"  FAIL {slug:30s} [{src['type']:12s}] HTTP {e.code}  {src['url']}",
+                print(f"  FAIL {slug:30s} [{src['type']:12s}] HTTP {status}  {src['url']}",
                       file=sys.stderr)
             except Exception as e:
                 failed += 1

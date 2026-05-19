@@ -65,16 +65,6 @@ sudo cp /home/peptide/peptide-corpus/.env /home/swell/swell-checker/.env
 sudo chown swell:swell /home/swell/swell-checker/.env
 sudo chmod 600 /home/swell/swell-checker/.env
 
-# Add Reddit API credentials to /home/swell/swell-checker/.env.
-# Register a script app at https://www.reddit.com/prefs/apps/
-sudo tee -a /home/swell/swell-checker/.env >/dev/null <<'EOF'
-SWELL_REDDIT_CLIENT_ID=...
-SWELL_REDDIT_CLIENT_SECRET=...
-SWELL_REDDIT_USER_AGENT=swell-checker/0.1:trend-radar:zoz
-EOF
-sudo chown swell:swell /home/swell/swell-checker/.env
-sudo chmod 600 /home/swell/swell-checker/.env
-
 # 5. First test run
 sudo -iu swell
 cd swell-checker
@@ -88,6 +78,12 @@ python3 -m venv .venv
 .venv/bin/python trend_router.py          # dry-run pending assistant actions
 .venv/bin/python watchlist.py             # preview Monday's digest
 ```
+
+Reddit sources use public subreddit JSON through `requests` by default. Optional
+authenticated Reddit access is still supported for higher-rate future use:
+install `praw`, register a script app at `https://www.reddit.com/prefs/apps/`,
+then add `SWELL_REDDIT_CLIENT_ID`, `SWELL_REDDIT_CLIENT_SECRET`, and
+`SWELL_REDDIT_USER_AGENT` to `.env`.
 
 ## Cron schedule
 
