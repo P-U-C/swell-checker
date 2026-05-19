@@ -1,0 +1,151 @@
+# swell-checker candidates - seed list for v0
+# Structure: slug, display_name, category, stage (for calibration), notes
+
+# STAGE DEFINITIONS:
+#   very_early  - pre-chasm, weak signals, probably noise
+#   approaching - late-early / early-mid, the chasm window (target zone)
+#   calibration - already mainstream, used to verify scorer says "high" correctly
+#   calibration_fizzled - plateaued/failed, used to verify scorer says "low" correctly
+
+candidates:
+  # --- Approaching chasm (target zone) ---
+  - slug: padel_us
+    display_name: "Padel (US)"
+    category: racquet_sport
+    stage: approaching
+    notes: "Global phenomenon catching on in US; tennis clubs converting courts"
+
+  - slug: run_clubs
+    display_name: "Run clubs (US)"
+    category: fitness_social
+    stage: approaching
+    notes: "Social-first running clubs in urban areas; distinct from competitive running"
+
+  - slug: nordic_walking
+    display_name: "Nordic walking"
+    category: fitness_low_impact
+    stage: approaching
+    notes: "Poles + walking; long-established in Europe, newly emerging in US"
+
+  - slug: cold_plunge
+    display_name: "Cold plunge / hot-cold therapy"
+    category: health_optimization
+    stage: approaching
+    notes: "DIY units (Plunge), social sauna-plunge clubs, contrast therapy protocols"
+
+  - slug: functional_fitness_smallbox
+    display_name: "Functional-fitness small-box gyms"
+    category: boutique_fitness
+    stage: approaching
+    notes: "Non-CrossFit-branded small-box gyms emphasizing functional movement"
+
+  - slug: sober_bars
+    display_name: "Sober / zero-proof bars"
+    category: hospitality
+    stage: approaching
+    notes: "Dedicated NA bars and zero-proof drinks programs"
+
+  - slug: rucking
+    display_name: "Rucking (weighted hiking)"
+    category: fitness_outdoor
+    stage: approaching
+    notes: "GoRuck-adjacent; weighted backpack walking, military-fitness crossover"
+
+  - slug: climbing_urban
+    display_name: "Urban climbing gyms"
+    category: fitness_adventure
+    stage: approaching
+    notes: "Bouldering-focused urban gyms; social, not Olympic-climbing-adjacent"
+
+  - slug: f45_alternatives
+    display_name: "F45 alternatives / group HIIT"
+    category: boutique_fitness
+    stage: approaching
+    notes: "Post-F45 collapse, what's replacing it - Barry's, Solidcore, etc"
+
+  # --- Very early (high false-positive risk zone) ---
+  - slug: speed_golf
+    display_name: "Speed golf"
+    category: hybrid_sport
+    stage: very_early
+    notes: "Golf + running hybrid; small community, could go anywhere"
+
+  - slug: social_sauna
+    display_name: "Social sauna clubs"
+    category: health_social
+    stage: very_early
+    notes: "Club-style saunas (Othership, Bathhouse NYC), emerging urban format"
+
+  - slug: mahjong_leagues
+    display_name: "Mahjong leagues (post-pandemic)"
+    category: social_game
+    stage: very_early
+    notes: "Organized mahjong leagues for young adults; TikTok-driven revival"
+
+  - slug: dawn_patrol_fitness
+    display_name: "Dawn patrol fitness"
+    category: fitness_social
+    stage: very_early
+    notes: "Early-morning (5-6am) group fitness meetups; identity-driven"
+
+  - slug: longevity_clinics
+    display_name: "Longevity clinics"
+    category: health_optimization
+    stage: very_early
+    notes: "Direct-pay longevity-medicine clinics; overlap with peptides"
+
+  - slug: pilates_reformer
+    display_name: "Pilates reformer studios"
+    category: boutique_fitness
+    stage: very_early
+    notes: "Reformer-specific studios, distinct from mat Pilates"
+
+  - slug: breath_work
+    display_name: "Breath-work practitioners"
+    category: wellness
+    stage: very_early
+    notes: "Wim Hof, holotropic, functional breathing - practitioner economy forming"
+
+  # --- Calibration: mainstream (scorer should say HIGH) ---
+  - slug: pickleball
+    display_name: "Pickleball (calibration - mainstream)"
+    category: racquet_sport
+    stage: calibration
+    notes: "Already past chasm; scorer should score high and flag as mature"
+
+  - slug: hyrox
+    display_name: "Hyrox (calibration - mainstream)"
+    category: fitness_racing
+    stage: calibration
+    notes: "Just crossed into mainstream 2024; should still score high"
+
+  - slug: peloton
+    display_name: "Peloton (calibration - mature)"
+    category: connected_fitness
+    stage: calibration
+    notes: "Past peak; should score moderate declining"
+
+  - slug: soulcycle
+    display_name: "SoulCycle (calibration - mature)"
+    category: boutique_fitness
+    stage: calibration
+    notes: "Peaked 2015-2018, now in decline; score should trend down"
+
+  - slug: barre
+    display_name: "Barre (calibration - mature)"
+    category: boutique_fitness
+    stage: calibration
+    notes: "Past peak; moderate baseline"
+
+  # --- Calibration: fizzled (scorer should say LOW) ---
+  - slug: axe_throwing
+    display_name: "Axe throwing (calibration - fizzled)"
+    category: experiential_entertainment
+    stage: calibration_fizzled
+    notes: "Plateaued as $200M novelty; scorer should stay low"
+
+  - slug: crossfit
+    display_name: "CrossFit (calibration - post-peak)"
+    category: functional_fitness
+    stage: calibration
+    notes: "Peaked ~2015; interesting long-tail case"

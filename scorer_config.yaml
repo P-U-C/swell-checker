@@ -1,0 +1,14 @@
+# swell-checker scorer config
+# Tune these, re-run scorer.py, iterate.
+
+velocity_window_months: 18
+spread_window_months: 24
+velocity_saturation: 15.0
+spread_saturation: 8.0
+
+weights:
+  velocity: 0.40
+  spread: 0.40
+  vocabulary: 0.20
+
+threshold: 0.55
