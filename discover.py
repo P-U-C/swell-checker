@@ -28,7 +28,14 @@ import json
 import sqlite3
 import subprocess
 import argparse
+import random
+import time
+import urllib.parse
 from datetime import datetime, timedelta
+
+import requests
+
+from ingest import BROWSER_UA
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(HERE, "db.sqlite")
@@ -38,6 +45,18 @@ SOURCES_YAML = os.path.join(HERE, "sources.yaml")
 SOURCE_TEXT_CAP = 45000
 GENERAL_CANDIDATE_SLUG = "__general__"
 OBSERVATION_DAYS = 28  # newly-promoted candidates wait 4 weeks before routing
+GOOGLE_RELATED_SLEEP_RANGE = (3.0, 5.0)
+GOOGLE_RELATED_NOISE_TERMS = {
+    "nike", "adidas", "amazon", "review", "vs", "price", "discount", "near me",
+}
+GOOGLE_TRENDING_LIFESTYLE_KEYWORDS = {
+    "fitness", "wellness", "food", "sport", "sports", "beauty", "hobby",
+    "retreat", "club", "studio", "gym", "class", "training", "workout",
+    "running", "run", "walking", "hiking", "cycling", "climbing", "yoga",
+    "pilates", "sauna", "pickleball", "padel", "skincare", "makeup", "diet",
+    "recipe", "coffee", "tea", "dance", "league", "tournament", "health",
+}
+HTTP_TIMEOUT = 20
 
 
 class AuthError(RuntimeError):
@@ -155,6 +174,134 @@ def existing_proposal_slugs(db):
         "SELECT canonical_slug FROM proposed_candidates"
     ).fetchall()
     return {row[0] for row in rows}
+
+
+def display_name_from_label(raw: str) -> str:
+    cleaned = re.sub(r"^[#r/]+", "", raw or "").strip()
+    cleaned = re.sub(r"[_\-]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.title() if cleaned else ""
+
+
+def slug_variants(raw: str):
+    slug = normalize_slug(raw)
+    if not slug:
+        return set()
+    variants = {slug}
+    if slug.endswith("ies") and len(slug) > 4:
+        variants.add(slug[:-3] + "y")
+    if slug.endswith("s") and not slug.endswith("ss") and len(slug) > 4:
+        variants.add(slug[:-1])
+    return variants
+
+
+def parse_growth_value(value):
+    """Return (numeric_growth_pct, label) for pytrends/TikTok growth fields."""
+    if value is None:
+        return None, "unknown"
+    text = str(value).strip()
+    if not text:
+        return None, "unknown"
+    if text.lower() == "breakout":
+        return 5001.0, "Breakout"
+    match = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+    if not match:
+        return None, text
+    number = float(match.group(0))
+    return number, f"{number:g}%"
+
+
+def confidence_from_growth(value):
+    growth, label = parse_growth_value(value)
+    if label == "Breakout":
+        return 0.85
+    if growth is None:
+        return 0.4
+    if growth > 250:
+        return 0.7
+    if growth > 100:
+        return 0.55
+    return 0.4
+
+
+def contains_configured_noise(text: str, terms) -> bool:
+    q = (text or "").lower()
+    tokens = set(re.findall(r"[a-z0-9]+", q))
+    for term in terms:
+        term_lc = term.lower()
+        if " " in term_lc:
+            if term_lc in q:
+                return True
+        elif term_lc in tokens:
+            return True
+    return False
+
+
+def is_seed_synonym(query: str, seed_slug: str, seed_query: str = "") -> bool:
+    q_variants = slug_variants(query)
+    if not q_variants:
+        return True
+    seed_variants = slug_variants(seed_slug) | slug_variants(seed_query)
+    return bool(q_variants & seed_variants)
+
+
+def is_lifestyle_query(query: str) -> bool:
+    q = (query or "").lower()
+    tokens = set(re.findall(r"[a-z0-9]+", q))
+    for keyword in GOOGLE_TRENDING_LIFESTYLE_KEYWORDS:
+        if keyword in tokens or keyword in q:
+            return True
+    return False
+
+
+def trends_url(query: str) -> str:
+    return (
+        "https://trends.google.com/trends/explore?geo=US&q="
+        + urllib.parse.quote_plus(query or "")
+    )
+
+
+def emit_structured_proposal(db, *, skip_slugs, raw_slug, display_name, category,
+                             explanation, surface, source_url, raw_label, quote,
+                             confidence, dry_run=False, seed_slug=None, geo="US",
+                             event_date=None):
+    canonical = normalize_slug(raw_slug or display_name)
+    if not canonical:
+        return "skipped_invalid", None
+    if canonical in skip_slugs:
+        return "skipped_existing", canonical
+
+    if dry_run:
+        skip_slugs.add(canonical)
+        print(f"  [proposal:{surface}] {canonical:<28s} {display_name[:42]:<42s} "
+              f"conf={confidence:.2f}")
+        return "new", canonical
+
+    pid, is_new = upsert_proposal(
+        db, canonical, display_name, category or "", explanation or ""
+    )
+    if pid is None:
+        return "skipped_invalid", canonical
+    insert_evidence(
+        db, pid, surface=surface, source_url=source_url, raw_label=raw_label,
+        quote=quote, event_date=event_date, confidence=confidence,
+        seed_slug=seed_slug, geo=geo,
+    )
+    skip_slugs.add(canonical)
+    return ("new" if is_new else "bumped"), canonical
+
+
+def bump_summary(summary, outcome):
+    if outcome == "new":
+        summary["proposals_new"] += 1
+        summary["evidence_rows"] += 1
+    elif outcome == "bumped":
+        summary["proposals_bumped"] += 1
+        summary["evidence_rows"] += 1
+    elif outcome == "skipped_existing":
+        summary["skipped_existing"] += 1
+    elif outcome == "skipped_invalid":
+        summary["skipped_invalid"] += 1
 
 
 # -- general-feed discovery adapter --------------------------------------
@@ -339,6 +486,229 @@ def run_general_feed_discovery(db, limit=30, model="sonnet", dry_run=False):
         "skipped_existing": skipped_existing,
     }
     print(f"\ndiscover.general_feed: {summary}")
+    return summary
+
+
+# -- Google related/rising discovery adapter -----------------------------
+
+class GoogleRelatedProvider:
+    """Provider wrapper for pytrends related/rising and daily trending calls."""
+
+    def __init__(self, geo="US", sleep_range=GOOGLE_RELATED_SLEEP_RANGE,
+                 backoff_seconds=60):
+        self.geo = geo
+        self.sleep_range = sleep_range
+        self.backoff_seconds = backoff_seconds
+        self._client = None
+
+    def _trend_client(self):
+        if self._client is None:
+            try:
+                from pytrends.request import TrendReq
+            except ImportError as exc:
+                raise RuntimeError("pytrends not installed; install requirements.txt") from exc
+            self._client = TrendReq(
+                hl="en-US",
+                tz=360,
+                requests_args={"headers": {"User-Agent": BROWSER_UA}},
+            )
+        return self._client
+
+    def _sleep(self):
+        low, high = self.sleep_range
+        if high <= 0:
+            return
+        time.sleep(random.uniform(low, high))
+
+    def _call_with_backoff(self, fn):
+        last_exc = None
+        for attempt in range(2):
+            self._sleep()
+            try:
+                return fn()
+            except Exception as exc:
+                last_exc = exc
+                if "429" in str(exc) and attempt == 0:
+                    time.sleep(self.backoff_seconds)
+                    continue
+                raise
+        raise last_exc
+
+    def rising_for(self, query):
+        def do_call():
+            client = self._trend_client()
+            client.build_payload([query], timeframe="today 12-m", geo=self.geo)
+            return client.related_queries()
+
+        data = self._call_with_backoff(do_call)
+        related = data.get(query) if isinstance(data, dict) else None
+        if related is None and isinstance(data, dict) and data:
+            related = next(iter(data.values()))
+        if not related:
+            return []
+        rising = related.get("rising")
+        if rising is None or getattr(rising, "empty", False):
+            return []
+        out = []
+        for row in rising.to_dict("records"):
+            raw_query = row.get("query")
+            if raw_query:
+                out.append((str(raw_query), row.get("value")))
+        return out
+
+    def trending_searches(self):
+        def do_call():
+            client = self._trend_client()
+            if hasattr(client, "today_searches"):
+                return client.today_searches(pn="united_states")
+            return client.trending_searches(pn="united_states")
+
+        df = self._call_with_backoff(do_call)
+        if df is None or getattr(df, "empty", False):
+            return []
+        values = []
+        for row in df.itertuples(index=False):
+            if row:
+                values.append(str(row[0]))
+        return values
+
+
+def google_related_reject_reason(query, seed_slug, seed_query, skip_slugs):
+    if contains_configured_noise(query, GOOGLE_RELATED_NOISE_TERMS):
+        return "noise"
+    if is_seed_synonym(query, seed_slug, seed_query):
+        return "seed_synonym"
+    if normalize_slug(query) in skip_slugs:
+        return "existing"
+    return None
+
+
+def run_google_related_discovery(db, limit=30, dry_run=False, provider=None):
+    """Discover adjacent proposals from Google Trends related/rising queries.
+
+    Also runs the broader daily Trending Searches surface as lower-confidence
+    recall, filtered through a lightweight lifestyle keyword allowlist.
+    """
+    provider = provider or GoogleRelatedProvider()
+    skip_slugs = existing_candidate_slugs(db) | existing_proposal_slugs(db)
+    summary = {
+        "seeds_scanned": 0,
+        "trending_checked": 0,
+        "proposals_new": 0,
+        "proposals_bumped": 0,
+        "evidence_rows": 0,
+        "skipped_existing": 0,
+        "skipped_invalid": 0,
+        "filtered_noise": 0,
+        "filtered_seed_synonym": 0,
+        "filtered_non_lifestyle": 0,
+        "provider_errors": 0,
+    }
+
+    rows = db.execute(
+        """SELECT c.slug, c.display_name, c.category, s.url
+           FROM candidates c
+           JOIN sources s ON s.candidate_id=c.id
+           WHERE c.status='tracking'
+             AND c.slug != ?
+             AND s.source_type='trends'
+           ORDER BY c.slug""",
+        (GENERAL_CANDIDATE_SLUG,),
+    ).fetchall()
+
+    print(f"discover.google_related: {len(rows)} trend seeds (dry_run={dry_run})")
+    emitted = 0
+    for seed_slug, seed_name, category, seed_query in rows:
+        if emitted >= limit:
+            break
+        summary["seeds_scanned"] += 1
+        try:
+            rising = provider.rising_for(seed_query)
+        except Exception as exc:
+            summary["provider_errors"] += 1
+            print(f"  FAIL google_related seed={seed_slug}: {type(exc).__name__}: {str(exc)[:140]}",
+                  file=sys.stderr)
+            continue
+
+        for raw_query, growth_value in rising:
+            if emitted >= limit:
+                break
+            reason = google_related_reject_reason(raw_query, seed_slug, seed_query, skip_slugs)
+            if reason == "noise":
+                summary["filtered_noise"] += 1
+                continue
+            if reason == "seed_synonym":
+                summary["filtered_seed_synonym"] += 1
+                continue
+            if reason == "existing":
+                summary["skipped_existing"] += 1
+                continue
+
+            growth, growth_label = parse_growth_value(growth_value)
+            conf = confidence_from_growth(growth_value)
+            quote = f"Google Trends rising related query for {seed_query}: {growth_label}"
+            outcome, _ = emit_structured_proposal(
+                db, skip_slugs=skip_slugs, raw_slug=raw_query,
+                display_name=display_name_from_label(raw_query),
+                category=category,
+                explanation=f"Rising Google related query around {seed_name}.",
+                surface="google_related",
+                source_url=trends_url(seed_query),
+                raw_label=raw_query,
+                quote=quote,
+                confidence=conf,
+                dry_run=dry_run,
+                seed_slug=seed_slug,
+                geo="US",
+                event_date=datetime.utcnow().strftime("%Y-%m-%d"),
+            )
+            bump_summary(summary, outcome)
+            if outcome in {"new", "bumped"}:
+                emitted += 1
+
+    if emitted < limit:
+        try:
+            trending = provider.trending_searches()
+        except Exception as exc:
+            summary["provider_errors"] += 1
+            print(f"  FAIL google_trending: {type(exc).__name__}: {str(exc)[:140]}",
+                  file=sys.stderr)
+            trending = []
+
+        for raw_query in trending:
+            if emitted >= limit:
+                break
+            summary["trending_checked"] += 1
+            if not is_lifestyle_query(raw_query):
+                summary["filtered_non_lifestyle"] += 1
+                continue
+            if contains_configured_noise(raw_query, GOOGLE_RELATED_NOISE_TERMS):
+                summary["filtered_noise"] += 1
+                continue
+            if normalize_slug(raw_query) in skip_slugs:
+                summary["skipped_existing"] += 1
+                continue
+            outcome, _ = emit_structured_proposal(
+                db, skip_slugs=skip_slugs, raw_slug=raw_query,
+                display_name=display_name_from_label(raw_query),
+                category="lifestyle",
+                explanation="Daily Google trending search with lifestyle keywords.",
+                surface="google_trending",
+                source_url=trends_url(raw_query),
+                raw_label=raw_query,
+                quote="Daily Google trending search; lower-confidence broad surface.",
+                confidence=0.35,
+                dry_run=dry_run,
+                geo="US",
+                event_date=datetime.utcnow().strftime("%Y-%m-%d"),
+            )
+            bump_summary(summary, outcome)
+            if outcome in {"new", "bumped"}:
+                emitted += 1
+
+    if not dry_run:
+        db.commit()
+    print(f"\ndiscover.google_related: {summary}")
     return summary
 
 
