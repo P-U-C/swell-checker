@@ -2,16 +2,15 @@
 """
 discover.py - Phase 2 trend-discovery layer.
 
-Captures new trend candidates from prose surfaces (general feeds today;
-Google related/rising and TikTok in Phase B+). Output goes into the
+Captures new trend candidates from prose, search, social, and forum surfaces.
+Output goes into the
 proposed_candidates + proposal_evidence tables, gated by operator
 approval. Nothing routes off discovery until --promote.
 
 See docs/phase-2-discovery-research.md for the architectural rationale.
 
 Subcommands:
-  --run             Iterate over unprocessed general-feed fetches; LLM
-                    extracts proposals; dedup against existing
+  --run             Run enabled discovery adapters; dedup against existing
                     candidates and existing proposals; write rows.
   --list-pending    Show pending_approval proposals (mirrors trend_router).
   --approve <id>    Mark proposal approved.
@@ -75,6 +74,19 @@ REDDIT_LIFESTYLE_KEYWORDS = {
     "nutrition", "recipe", "coffee", "tea", "outdoor", "training", "league",
 }
 HTTP_TIMEOUT = 20
+DEFAULT_ADAPTERS = ("general_feed", "google_related", "tiktok", "reddit_growing")
+ADAPTER_ALIASES = {
+    "all": "all",
+    "general": "general_feed",
+    "general_feed": "general_feed",
+    "google": "google_related",
+    "google_related": "google_related",
+    "google_trending": "google_related",
+    "tiktok": "tiktok",
+    "tiktok_creative_center": "tiktok",
+    "reddit": "reddit_growing",
+    "reddit_growing": "reddit_growing",
+}
 
 
 class AuthError(RuntimeError):
@@ -874,10 +886,10 @@ class TikTokCreativeProvider:
 def tiktok_hashtag_reject_reason(hashtag, skip_slugs):
     tag = (hashtag or "").lstrip("#").strip()
     tag_lc = tag.lower()
-    if len(tag) < 4 or len(tag) > 35:
-        return "length"
     if tag_lc in TIKTOK_HASHTAG_STOPWORDS:
         return "platform_jargon"
+    if len(tag) < 4 or len(tag) > 35:
+        return "length"
     if normalize_slug(tag) in skip_slugs:
         return "existing"
     return None
@@ -1232,6 +1244,44 @@ def run_reddit_growing_discovery(db, limit=30, dry_run=False, provider=None):
     return summary
 
 
+def resolve_adapters(adapter_name):
+    if adapter_name is None:
+        return list(DEFAULT_ADAPTERS)
+    resolved = ADAPTER_ALIASES.get(adapter_name)
+    if resolved is None:
+        raise ValueError(f"unknown adapter: {adapter_name}")
+    if resolved == "all":
+        return list(DEFAULT_ADAPTERS)
+    return [resolved]
+
+
+def run_discovery_adapters(db, adapters, limit_per_adapter=30, model="sonnet", dry_run=False):
+    summaries = {}
+    for adapter in adapters:
+        if adapter == "general_feed":
+            summary = run_general_feed_discovery(
+                db, limit=limit_per_adapter, model=model, dry_run=dry_run
+            )
+        elif adapter == "google_related":
+            summary = run_google_related_discovery(
+                db, limit=limit_per_adapter, dry_run=dry_run
+            )
+        elif adapter == "tiktok":
+            summary = run_tiktok_creative_discovery(
+                db, limit=limit_per_adapter, dry_run=dry_run
+            )
+        elif adapter == "reddit_growing":
+            summary = run_reddit_growing_discovery(
+                db, limit=limit_per_adapter, dry_run=dry_run
+            )
+        else:
+            raise ValueError(f"unknown adapter: {adapter}")
+        summaries[adapter] = summary
+        if summary is None:
+            return None
+    return summaries
+
+
 # -- CLI subcommands ------------------------------------------------------
 
 def list_pending(db):
@@ -1393,9 +1443,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument("--db", default=DB, help="SQLite db path")
     ap.add_argument("--run", action="store_true",
-                    help="Run discovery adapters over unprocessed fetches")
-    ap.add_argument("--limit", type=int, default=30,
-                    help="Max fetches per adapter run")
+                    help="Run discovery adapters")
+    ap.add_argument("--adapter", default=None,
+                    choices=sorted(ADAPTER_ALIASES.keys()),
+                    help="Limit --run to one adapter")
+    ap.add_argument("--limit-per-adapter", type=int, default=30,
+                    help="Max proposals/fetches per adapter run")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="Backward-compatible alias for --limit-per-adapter")
     ap.add_argument("--model", default="sonnet",
                     help="Claude model for discovery prompt")
     ap.add_argument("--dry-run", action="store_true",
@@ -1430,10 +1485,17 @@ def main():
     ensure_discovery_schema(db)
 
     if args.run:
-        summary = run_general_feed_discovery(
-            db, limit=args.limit, model=args.model, dry_run=args.dry_run
+        limit_per_adapter = args.limit if args.limit is not None else args.limit_per_adapter
+        try:
+            adapters = resolve_adapters(args.adapter)
+        except ValueError as exc:
+            print(f"FAIL: {exc}", file=sys.stderr)
+            return 1
+        summaries = run_discovery_adapters(
+            db, adapters, limit_per_adapter=limit_per_adapter,
+            model=args.model, dry_run=args.dry_run,
         )
-        return 0 if summary is not None else 2
+        return 0 if summaries is not None else 2
     if args.list_pending:
         list_pending(db)
         return 0
