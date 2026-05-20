@@ -64,6 +64,16 @@ TIKTOK_HASHTAG_STOPWORDS = {
     "fyp", "foryou", "foryoupage", "viral", "trending", "trend", "xyzcba",
     "tiktokmademebuyit", "tiktok", "duet", "stitch", "capcut",
 }
+REDDIT_GENERIC_SUBS = {
+    "all", "popular", "askreddit", "funny", "news", "worldnews", "pics",
+    "videos", "gaming",
+}
+REDDIT_LIFESTYLE_KEYWORDS = {
+    "gym", "workout", "running", "runner", "wellness", "food", "drink",
+    "social", "class", "studio", "practice", "club", "sport", "fitness",
+    "health", "hiking", "cycling", "climbing", "yoga", "pilates", "sauna",
+    "nutrition", "recipe", "coffee", "tea", "outdoor", "training", "league",
+}
 HTTP_TIMEOUT = 20
 
 
@@ -964,6 +974,261 @@ def run_tiktok_creative_discovery(db, limit=30, dry_run=False, provider=None):
     if not dry_run:
         db.commit()
     print(f"\ndiscover.tiktok: {summary}")
+    return summary
+
+
+# -- Reddit growing subreddit discovery adapter --------------------------
+
+class RedditGrowingProvider:
+    """Provider wrapper for official Reddit popular subs plus fallback lists."""
+
+    REDDIT_POPULAR_URL = "https://www.reddit.com/subreddits/popular.json"
+    SUBREDDITSTATS_URLS = (
+        "https://subredditstats.com/api/recently-popular",
+        "https://subredditstats.com/api/list/recently-popular",
+    )
+
+    def __init__(self, session=None, backoff_seconds=60):
+        self.session = session or requests.Session()
+        self.session.headers.update({
+            "User-Agent": os.environ.get("SWELL_REDDIT_USER_AGENT", BROWSER_UA),
+            "Accept": "application/json,text/plain,*/*",
+        })
+        self.backoff_seconds = backoff_seconds
+
+    def growing_subreddits(self, limit=30):
+        records = self._from_reddit_json(limit)
+        if records:
+            return records
+        records = self._from_praw(limit)
+        if records:
+            return records
+        return self._from_subredditstats(limit)
+
+    def _from_reddit_json(self, limit):
+        try:
+            response = self.session.get(
+                self.REDDIT_POPULAR_URL, params={"limit": limit}, timeout=HTTP_TIMEOUT
+            )
+            if response.status_code == 429:
+                time.sleep(self.backoff_seconds)
+                response = self.session.get(
+                    self.REDDIT_POPULAR_URL, params={"limit": limit}, timeout=HTTP_TIMEOUT
+                )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            return []
+        children = payload.get("data", {}).get("children", [])
+        out = []
+        for child in children:
+            data = child.get("data", {}) if isinstance(child, dict) else {}
+            name = data.get("display_name") or data.get("display_name_prefixed")
+            if not name:
+                continue
+            out.append({
+                "name": name,
+                "display_name_prefixed": data.get("display_name_prefixed") or f"r/{name}",
+                "description": data.get("public_description") or data.get("title") or "",
+                "subscribers": data.get("subscribers"),
+                "growth_rate": None,
+                "source": "reddit_popular",
+            })
+        return out
+
+    def _from_praw(self, limit):
+        try:
+            from ingest import reddit_credentials_present, reddit_client
+            if not reddit_credentials_present():
+                return []
+            reddit = reddit_client()
+            subs = reddit.subreddits.popular(limit=limit)
+        except Exception:
+            return []
+        out = []
+        for sub in subs:
+            out.append({
+                "name": getattr(sub, "display_name", ""),
+                "display_name_prefixed": getattr(sub, "display_name_prefixed", ""),
+                "description": (
+                    getattr(sub, "public_description", "") or
+                    getattr(sub, "title", "")
+                ),
+                "subscribers": getattr(sub, "subscribers", None),
+                "growth_rate": None,
+                "source": "reddit_praw_popular",
+            })
+        return [r for r in out if r["name"]]
+
+    def _from_subredditstats(self, limit):
+        for url in self.SUBREDDITSTATS_URLS:
+            try:
+                response = self.session.get(url, timeout=HTTP_TIMEOUT)
+                if response.status_code == 429:
+                    time.sleep(self.backoff_seconds)
+                    response = self.session.get(url, timeout=HTTP_TIMEOUT)
+                response.raise_for_status()
+                payload = response.json()
+            except Exception:
+                continue
+            records = self._extract_stats_records(payload)
+            if records:
+                return records[:limit]
+        return []
+
+    def _extract_stats_records(self, payload):
+        out = []
+        seen = set()
+
+        def walk(node):
+            if isinstance(node, dict):
+                name = (
+                    node.get("subreddit") or node.get("name") or
+                    node.get("display_name") or node.get("displayName")
+                )
+                if isinstance(name, str):
+                    clean = normalize_subreddit_name(name)
+                    if clean and clean not in seen:
+                        seen.add(clean)
+                        out.append({
+                            "name": clean,
+                            "display_name_prefixed": f"r/{clean}",
+                            "description": (
+                                node.get("description") or node.get("public_description") or
+                                node.get("title") or ""
+                            ),
+                            "subscribers": (
+                                node.get("subscribers") or node.get("subscriber_count") or
+                                node.get("subs")
+                            ),
+                            "growth_rate": (
+                                node.get("growth_rate") or node.get("growth") or
+                                node.get("growth_7d") or node.get("delta")
+                            ),
+                            "source": "subredditstats",
+                        })
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(payload)
+        return out
+
+
+def normalize_subreddit_name(raw):
+    name = (raw or "").strip()
+    name = re.sub(r"^/?r/", "", name, flags=re.I)
+    name = name.strip().strip("/")
+    return re.sub(r"[^A-Za-z0-9_]", "", name).lower()
+
+
+def reddit_growing_reject_reason(record, skip_slugs):
+    name = normalize_subreddit_name(record.get("name") or record.get("display_name_prefixed"))
+    if not name:
+        return "invalid"
+    if name in REDDIT_GENERIC_SUBS:
+        return "generic"
+    if normalize_slug(name) in skip_slugs:
+        return "existing"
+    desc = " ".join([
+        name,
+        record.get("display_name_prefixed") or "",
+        record.get("description") or "",
+    ]).lower()
+    if not any(keyword in desc for keyword in REDDIT_LIFESTYLE_KEYWORDS):
+        return "non_lifestyle"
+    return None
+
+
+def format_reddit_evidence(record):
+    desc = (record.get("description") or "").strip()
+    subscribers = compact_count(record.get("subscribers"))
+    growth = record.get("growth_rate")
+    _, growth_label = parse_growth_value(growth)
+    parts = []
+    if desc:
+        parts.append(desc[:220])
+    if subscribers != "unknown":
+        parts.append(f"{subscribers} subscribers")
+    if growth_label != "unknown":
+        parts.append(f"{growth_label} growth")
+    else:
+        parts.append("growth rate unavailable")
+    return " | ".join(parts)
+
+
+def run_reddit_growing_discovery(db, limit=30, dry_run=False, provider=None):
+    provider = provider or RedditGrowingProvider()
+    skip_slugs = existing_candidate_slugs(db) | existing_proposal_slugs(db)
+    summary = {
+        "subreddits_checked": 0,
+        "proposals_new": 0,
+        "proposals_bumped": 0,
+        "evidence_rows": 0,
+        "skipped_existing": 0,
+        "skipped_invalid": 0,
+        "filtered_generic": 0,
+        "filtered_non_lifestyle": 0,
+        "provider_errors": 0,
+    }
+
+    print(f"discover.reddit_growing: fetching up to {limit} subreddits (dry_run={dry_run})")
+    try:
+        records = provider.growing_subreddits(limit=limit * 3)
+    except Exception as exc:
+        summary["provider_errors"] += 1
+        print(f"  FAIL reddit_growing: {type(exc).__name__}: {str(exc)[:140]}",
+              file=sys.stderr)
+        records = []
+
+    emitted = 0
+    for record in records:
+        if emitted >= limit:
+            break
+        if isinstance(record, str):
+            record = {"name": record, "display_name_prefixed": f"r/{record}"}
+        summary["subreddits_checked"] += 1
+        reason = reddit_growing_reject_reason(record, skip_slugs)
+        if reason == "invalid":
+            summary["skipped_invalid"] += 1
+            continue
+        if reason == "generic":
+            summary["filtered_generic"] += 1
+            continue
+        if reason == "existing":
+            summary["skipped_existing"] += 1
+            continue
+        if reason == "non_lifestyle":
+            summary["filtered_non_lifestyle"] += 1
+            continue
+
+        name = normalize_subreddit_name(record.get("name") or record.get("display_name_prefixed"))
+        conf = confidence_from_growth(record.get("growth_rate"))
+        if conf < 0.35:
+            conf = 0.35
+        outcome, _ = emit_structured_proposal(
+            db, skip_slugs=skip_slugs, raw_slug=name,
+            display_name=f"r/{name}",
+            category="reddit_lifestyle",
+            explanation="Growing or popular subreddit with lifestyle/physical keywords.",
+            surface="reddit_growing",
+            source_url=f"https://www.reddit.com/r/{name}/",
+            raw_label=f"r/{name}",
+            quote=format_reddit_evidence(record),
+            confidence=conf,
+            dry_run=dry_run,
+            geo="US",
+            event_date=datetime.utcnow().strftime("%Y-%m-%d"),
+        )
+        bump_summary(summary, outcome)
+        if outcome in {"new", "bumped"}:
+            emitted += 1
+
+    if not dry_run:
+        db.commit()
+    print(f"\ndiscover.reddit_growing: {summary}")
     return summary
 
 
