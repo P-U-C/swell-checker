@@ -10,16 +10,17 @@
 
 # General feeds - fetched once, LLM matches articles to candidates
 general_feeds:
-  - {type: general_feed, url: "https://www.nytimes.com/services/xml/rss/nyt/Style.xml", label: "NYT Style"}
-  - {type: general_feed, url: "https://www.nytimes.com/services/xml/rss/nyt/Well.xml", label: "NYT Well"}
-  - {type: general_feed, url: "https://www.theatlantic.com/feed/channel/family/", label: "Atlantic Family"}
-  - {type: general_feed, url: "https://www.vox.com/culture/rss/index.xml", label: "Vox Culture"}
   - {type: general_feed, url: "https://www.outsideonline.com/rss", label: "Outside Magazine"}
   - {type: general_feed, url: "https://www.wellandgood.com/feed", label: "Well+Good"}
-  - {type: general_feed, url: "https://www.menshealth.com/rss/all.xml", label: "Men's Health"}
-  - {type: general_feed, url: "https://www.womenshealthmag.com/rss/all.xml", label: "Women's Health"}
-  - {type: general_feed, url: "https://www.axios.com/rss/feed.xml", label: "Axios"}
   - {type: general_feed, url: "https://hnrss.org/frontpage", label: "Hacker News frontpage"}
+  - {type: general_feed, url: "https://i-d.co/rss", label: "i-D Magazine"}
+  - {type: general_feed, url: "https://www.dazeddigital.com/rss", label: "Dazed"}
+  - {type: general_feed, url: "https://www.highsnobiety.com/feed/", label: "Highsnobiety"}
+  - {type: general_feed, url: "https://hypebae.com/feed", label: "Hypebae"}
+  - {type: general_feed, url: "https://www.refinery29.com/en-us/rss.xml", label: "Refinery29"}
+  - {type: general_feed, url: "https://embedded.substack.com/feed", label: "Embedded"}
+  - {type: general_feed, url: "https://aftermath.site/feed", label: "Aftermath"}
+  - {type: general_feed, url: "https://defector.com/rss", label: "Defector"}
 
 # Per-candidate sources - now just Reddit (old.reddit.com) + Trends
 # No topical news queries. The general feeds cover that function.
