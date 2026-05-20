@@ -136,3 +136,40 @@ CREATE INDEX IF NOT EXISTS proposal_evidence_proposal_idx
     ON proposal_evidence(proposal_id);
 CREATE INDEX IF NOT EXISTS proposal_evidence_surface_idx
     ON proposal_evidence(surface, created_at);
+
+-- Discovery provider state/circuit breakers. This lets adapters fail closed
+-- and explain cooldowns across separate cron runs.
+CREATE TABLE IF NOT EXISTS provider_state (
+    provider_name TEXT PRIMARY KEY,
+    last_success_at TIMESTAMP,
+    last_failure_at TIMESTAMP,
+    last_failure_message TEXT,
+    consecutive_failures INTEGER DEFAULT 0,
+    success_count INTEGER DEFAULT 0,
+    failure_count INTEGER DEFAULT 0,
+    disabled_until TIMESTAMP,
+    notes TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS provider_seed_query_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_name TEXT NOT NULL,
+    seed_slug TEXT NOT NULL,
+    query_date DATE NOT NULL,
+    success INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(provider_name, seed_slug, query_date)
+);
+CREATE INDEX IF NOT EXISTS provider_seed_query_history_idx
+    ON provider_seed_query_history(provider_name, seed_slug, query_date);
+
+CREATE TABLE IF NOT EXISTS subreddit_subscriber_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subreddit TEXT NOT NULL,
+    subscribers INTEGER NOT NULL,
+    snapshot_date DATE NOT NULL,
+    UNIQUE(subreddit, snapshot_date)
+);
+CREATE INDEX IF NOT EXISTS subreddit_subscriber_history_idx
+    ON subreddit_subscriber_history(subreddit, snapshot_date);

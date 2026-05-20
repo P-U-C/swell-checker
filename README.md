@@ -146,8 +146,8 @@ captures candidates the operator hasn't named yet from four adapter surfaces:
 - `google_related` — seed-adjacent Google Trends related/rising queries, plus
   lower-confidence daily trending searches.
 - `tiktok` — TikTok Creative Center trending hashtags in lifestyle categories.
-- `reddit_growing` — popular/growing subreddits filtered through lifestyle
-  keywords; this is intentionally the noisiest discovery surface.
+- `reddit_growing` — watched subreddit subscriber deltas from `about.json`,
+  filtered through lifestyle keywords.
 
 Discovery writes to `proposed_candidates` + `proposal_evidence` tables — it
 **does not** touch the live watchlist until the operator promotes a proposal.
@@ -160,6 +160,8 @@ The promotion creates a candidate with `status='observing'` and a
 .venv/bin/python discover.py --run --adapter google_related --dry-run --limit-per-adapter 5
 .venv/bin/python discover.py --run --adapter tiktok --dry-run --limit-per-adapter 5
 .venv/bin/python discover.py --run --adapter reddit_growing --dry-run --limit-per-adapter 5
+.venv/bin/python discover.py --provider-status     # provider cooldown/disable state
+.venv/bin/python discover.py --provider-reset tiktok_creative_center
 .venv/bin/python discover.py --list-pending        # review queue
 .venv/bin/python discover.py --show 17             # full dossier for one
 .venv/bin/python discover.py --approve 17          # mark approved
@@ -169,6 +171,20 @@ The promotion creates a candidate with `status='observing'` and a
 
 `--limit` is still accepted as a backward-compatible alias for
 `--limit-per-adapter`.
+
+### Status check
+
+Discovery providers keep state in `provider_state` so upstream gating is visible
+instead of silently producing zero proposals:
+
+```text
+$ .venv/bin/python discover.py --provider-status
+provider                     avail last_success           fail disabled_until        note
+google_related_pytrends      no    2026-05-20 17:45 UTC     0 -                     seed=padel_us query=padel
+google_trending_pytrends     yes   never                     0 -
+tiktok_creative_center       no    never                     5 2026-05-20 23:45 UTC  403 Unauthorized - TIKTOK_COOKIE may have expired
+reddit_subscriber_delta      yes   2026-05-20 17:46 UTC     0 -                     snapshots=32
+```
 
 See `docs/phase-2-discovery-research.md` for the architectural rationale
 (sidecar proposal model, two-table dedup, observation gate, provider abstraction).

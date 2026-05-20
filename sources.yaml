@@ -22,6 +22,43 @@ general_feeds:
   - {type: general_feed, url: "https://aftermath.site/feed", label: "Aftermath"}
   - {type: general_feed, url: "https://defector.com/rss", label: "Defector"}
 
+# Discovery-only Reddit seeds. The reddit_growing adapter snapshots
+# subscribers from /about.json and compares weekly deltas; these are not
+# normal ingest sources.
+discovery_reddit_seeds:
+  - {subreddit: "RunClub", category: "fitness_social"}
+  - {subreddit: "running", category: "fitness_social"}
+  - {subreddit: "trailrunning", category: "fitness_outdoor"}
+  - {subreddit: "Rucking", category: "fitness_outdoor"}
+  - {subreddit: "xxfitness", category: "fitness"}
+  - {subreddit: "bodyweightfitness", category: "fitness"}
+  - {subreddit: "functionalfitness", category: "fitness"}
+  - {subreddit: "pilates", category: "studio_fitness"}
+  - {subreddit: "barre", category: "studio_fitness"}
+  - {subreddit: "yoga", category: "wellness"}
+  - {subreddit: "Breathwork", category: "wellness"}
+  - {subreddit: "Sauna", category: "wellness"}
+  - {subreddit: "Coldplunge", category: "wellness"}
+  - {subreddit: "wimhof", category: "wellness"}
+  - {subreddit: "longevity", category: "wellness"}
+  - {subreddit: "nutrition", category: "food_health"}
+  - {subreddit: "MealPrepSunday", category: "food_health"}
+  - {subreddit: "fermentation", category: "food_hobby"}
+  - {subreddit: "Coffee", category: "food_beverage"}
+  - {subreddit: "tea", category: "food_beverage"}
+  - {subreddit: "bouldering", category: "fitness_outdoor"}
+  - {subreddit: "climbing", category: "fitness_outdoor"}
+  - {subreddit: "hiking", category: "fitness_outdoor"}
+  - {subreddit: "camping", category: "outdoor_lifestyle"}
+  - {subreddit: "Pickleball", category: "social_sport"}
+  - {subreddit: "padel", category: "social_sport"}
+  - {subreddit: "Mahjong", category: "social_hobby"}
+  - {subreddit: "dance", category: "social_hobby"}
+  - {subreddit: "skincareaddiction", category: "beauty"}
+  - {subreddit: "AsianBeauty", category: "beauty"}
+  - {subreddit: "MakeupAddiction", category: "beauty"}
+  - {subreddit: "stopdrinking", category: "sober_social"}
+
 # Per-candidate sources - now just Reddit (old.reddit.com) + Trends
 # No topical news queries. The general feeds cover that function.
 sources:

@@ -18,6 +18,8 @@ Subcommands:
   --promote <id>    Create candidate row with status='observing' +
                     router_eligible_at = now + OBSERVATION_DAYS; seed
                     default sources (Google Trends only at this stage).
+  --provider-status Show provider cooldown/failure/circuit-breaker state.
+  --provider-reset  Clear disabled_until and failure count for one provider.
 """
 
 import os
@@ -27,12 +29,13 @@ import json
 import sqlite3
 import subprocess
 import argparse
-import random
 import time
 import urllib.parse
-from datetime import datetime, timedelta
+import threading
+from datetime import date, datetime, timedelta
 
 import requests
+import yaml
 
 from ingest import BROWSER_UA
 
@@ -44,7 +47,33 @@ SOURCES_YAML = os.path.join(HERE, "sources.yaml")
 SOURCE_TEXT_CAP = 45000
 GENERAL_CANDIDATE_SLUG = "__general__"
 OBSERVATION_DAYS = 28  # newly-promoted candidates wait 4 weeks before routing
-GOOGLE_RELATED_SLEEP_RANGE = (3.0, 5.0)
+PROVIDER_POLICY = {
+    "google_related_pytrends": {
+        "cooldown_seconds": 90,
+        "disable_threshold": 3,
+        "disable_minutes": 1440,
+    },
+    "google_trending_pytrends": {
+        "cooldown_seconds": 90,
+        "disable_threshold": 3,
+        "disable_minutes": 1440,
+    },
+    "tiktok_creative_center": {
+        "cooldown_seconds": 60,
+        "disable_threshold": 5,
+        "disable_minutes": 360,
+    },
+    "reddit_subscriber_delta": {
+        "cooldown_seconds": 30,
+        "disable_threshold": 10,
+        "disable_minutes": 60,
+    },
+}
+DEFAULT_PROVIDER_POLICY = {
+    "cooldown_seconds": 0,
+    "disable_threshold": 3,
+    "disable_minutes": 60,
+}
 GOOGLE_RELATED_NOISE_TERMS = {
     "nike", "adidas", "amazon", "review", "vs", "price", "discount", "near me",
 }
@@ -72,9 +101,17 @@ REDDIT_LIFESTYLE_KEYWORDS = {
     "social", "class", "studio", "practice", "club", "sport", "fitness",
     "health", "hiking", "cycling", "climbing", "yoga", "pilates", "sauna",
     "nutrition", "recipe", "coffee", "tea", "outdoor", "training", "league",
+    "beauty", "skincare", "makeup", "sober",
 }
 HTTP_TIMEOUT = 20
+REDDIT_SUBSCRIBER_GROWTH_THRESHOLD = 5.0
+REDDIT_SUBSCRIBER_MIN_HISTORY_DAYS = 14
 DEFAULT_ADAPTERS = ("general_feed", "google_related", "tiktok", "reddit_growing")
+ADAPTER_PROVIDER_STATES = {
+    "google_related": ("google_related_pytrends", "google_trending_pytrends"),
+    "tiktok": ("tiktok_creative_center",),
+    "reddit_growing": ("reddit_subscriber_delta",),
+}
 ADAPTER_ALIASES = {
     "all": "all",
     "general": "general_feed",
@@ -91,6 +128,264 @@ ADAPTER_ALIASES = {
 
 class AuthError(RuntimeError):
     pass
+
+
+def utcnow():
+    return datetime.utcnow()
+
+
+def parse_db_timestamp(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip().replace("T", " ").replace("Z", "")
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:26] if "." in text else text[:19], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def format_utc(value):
+    dt = parse_db_timestamp(value)
+    if not dt:
+        return "never"
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def age_label(value):
+    dt = parse_db_timestamp(value)
+    if not dt:
+        return "never"
+    seconds = max(0, int((utcnow() - dt).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+def is_rate_limit_error(exc):
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "429" in text or "too many requests" in text or "ratelimit" in text
+
+
+def env_int(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def google_related_max_seeds_per_run():
+    return max(1, env_int("GOOGLE_RELATED_MAX_SEEDS_PER_RUN", 5))
+
+
+def tiktok_categories():
+    raw = os.environ.get("TIKTOK_CATEGORIES", "").strip()
+    if not raw:
+        return TIKTOK_CREATIVE_CATEGORIES
+    parsed = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return parsed or TIKTOK_CREATIVE_CATEGORIES
+
+
+def provider_policy(name, override=None):
+    policy = dict(DEFAULT_PROVIDER_POLICY)
+    policy.update(PROVIDER_POLICY.get(name, {}))
+    if override:
+        policy.update(override)
+    return policy
+
+
+def provider_action_hint(name):
+    if name == "tiktok_creative_center":
+        return "re-paste TIKTOK_COOKIE in .env and run `discover.py --provider-reset tiktok_creative_center`"
+    if name.startswith("google_"):
+        return f"wait for the cooldown or run `discover.py --provider-reset {name}` after confirming Google is reachable"
+    if name == "reddit_subscriber_delta":
+        return "check Reddit about.json reachability from the worker and run `discover.py --provider-reset reddit_subscriber_delta`"
+    return f"inspect upstream credentials/network and run `discover.py --provider-reset {name}`"
+
+
+def send_provider_disabled_alert(provider_name, row, disabled_until, error_message):
+    if not os.environ.get("TG_BOT_TOKEN") or not os.environ.get("TG_CHAT_ID"):
+        return
+    last_success = row.get("last_success_at")
+    text = "\n".join([
+        "swell-checker [PROVIDER DISABLED]",
+        f"provider: {provider_name}",
+        f"last_success: {format_utc(last_success)} ({age_label(last_success)})",
+        f"consecutive_failures: {row.get('consecutive_failures', 0)}",
+        f"last_error: \"{str(error_message or '')[:500]}\"",
+        f"disabled_until: {format_utc(disabled_until)}",
+        f"action: {provider_action_hint(provider_name)}",
+    ])
+
+    def worker():
+        try:
+            import notify
+            notify.send(text)
+        except Exception as exc:
+            print(f"provider_state: alert send failed: {exc}", file=sys.stderr)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+class ProviderState:
+    def __init__(self, db, name, policy=None):
+        self.db = db
+        self.name = name
+        self.policy = provider_policy(name, policy)
+        self.db.execute(
+            """INSERT OR IGNORE INTO provider_state
+               (provider_name, consecutive_failures, success_count, failure_count)
+               VALUES (?, 0, 0, 0)""",
+            (name,),
+        )
+        self.db.commit()
+
+    def row(self):
+        row = self.db.execute(
+            """SELECT provider_name, last_success_at, last_failure_at,
+                      last_failure_message, consecutive_failures, success_count,
+                      failure_count, disabled_until, notes, updated_at
+               FROM provider_state WHERE provider_name=?""",
+            (self.name,),
+        ).fetchone()
+        if not row:
+            return {}
+        keys = (
+            "provider_name", "last_success_at", "last_failure_at",
+            "last_failure_message", "consecutive_failures", "success_count",
+            "failure_count", "disabled_until", "notes", "updated_at",
+        )
+        return dict(zip(keys, row))
+
+    def _last_call_at(self, row=None):
+        row = row or self.row()
+        candidates = [
+            parse_db_timestamp(row.get("last_success_at")),
+            parse_db_timestamp(row.get("last_failure_at")),
+        ]
+        candidates = [dt for dt in candidates if dt is not None]
+        return max(candidates) if candidates else None
+
+    def is_available(self):
+        row = self.row()
+        now = utcnow()
+        disabled_until = parse_db_timestamp(row.get("disabled_until"))
+        if disabled_until and disabled_until > now:
+            return False
+        cooldown = int(self.policy.get("cooldown_seconds", 0) or 0)
+        last_call = self._last_call_at(row)
+        if cooldown > 0 and last_call:
+            return (now - last_call).total_seconds() >= cooldown
+        return True
+
+    def unavailable_reason(self):
+        row = self.row()
+        now = utcnow()
+        disabled_until = parse_db_timestamp(row.get("disabled_until"))
+        if disabled_until and disabled_until > now:
+            seconds = int((disabled_until - now).total_seconds())
+            return f"disabled until {format_utc(disabled_until)} ({seconds}s remaining)"
+        remaining = self.cooldown_remaining_seconds()
+        if remaining > 0:
+            return f"cooldown {remaining}s remaining"
+        return ""
+
+    def cooldown_remaining_seconds(self):
+        row = self.row()
+        now = utcnow()
+        disabled_until = parse_db_timestamp(row.get("disabled_until"))
+        disabled_remaining = 0
+        if disabled_until and disabled_until > now:
+            disabled_remaining = int((disabled_until - now).total_seconds())
+        cooldown = int(self.policy.get("cooldown_seconds", 0) or 0)
+        cooldown_remaining = 0
+        last_call = self._last_call_at(row)
+        if cooldown > 0 and last_call:
+            elapsed = int((now - last_call).total_seconds())
+            cooldown_remaining = max(0, cooldown - elapsed)
+        return max(disabled_remaining, cooldown_remaining)
+
+    def record_success(self, notes=None):
+        now = utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        self.db.execute(
+            """UPDATE provider_state
+               SET last_success_at=?,
+                   consecutive_failures=0,
+                   success_count=success_count+1,
+                   disabled_until=NULL,
+                   notes=COALESCE(?, notes),
+                   updated_at=?
+               WHERE provider_name=?""",
+            (now, notes, now, self.name),
+        )
+        self.db.commit()
+
+    def record_failure(self, error_message, disable_minutes=None, force_disable=False):
+        before = self.row()
+        now_dt = utcnow()
+        now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        consecutive = int(before.get("consecutive_failures") or 0) + 1
+        threshold = int(self.policy.get("disable_threshold", 1) or 1)
+        minutes = int(
+            disable_minutes
+            if disable_minutes is not None
+            else self.policy.get("disable_minutes", 60)
+        )
+        disabled_until = None
+        if force_disable or consecutive >= threshold:
+            disabled_until = now_dt + timedelta(minutes=minutes)
+        disabled_until_str = (
+            disabled_until.strftime("%Y-%m-%d %H:%M:%S")
+            if disabled_until else before.get("disabled_until")
+        )
+        self.db.execute(
+            """UPDATE provider_state
+               SET last_failure_at=?,
+                   last_failure_message=?,
+                   consecutive_failures=?,
+                   failure_count=failure_count+1,
+                   disabled_until=?,
+                   updated_at=?
+               WHERE provider_name=?""",
+            (now, str(error_message or "")[:1000], consecutive,
+             disabled_until_str, now, self.name),
+        )
+        self.db.commit()
+
+        previous_disabled = parse_db_timestamp(before.get("disabled_until"))
+        was_disabled = previous_disabled and previous_disabled > now_dt
+        if disabled_until and not was_disabled:
+            after = self.row()
+            send_provider_disabled_alert(
+                self.name, after, disabled_until_str, error_message
+            )
+
+    def reset(self):
+        now = utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        self.db.execute(
+            """UPDATE provider_state
+               SET consecutive_failures=0,
+                   failure_count=0,
+                   last_failure_message=NULL,
+                   disabled_until=NULL,
+                   updated_at=?
+               WHERE provider_name=?""",
+            (now, self.name),
+        )
+        self.db.commit()
 
 
 def run_claude(prompt_text: str, model: str = "sonnet", timeout: int = 300) -> str:
@@ -156,6 +451,48 @@ def ensure_discovery_schema(db):
     db.execute(
         "CREATE INDEX IF NOT EXISTS proposal_evidence_surface_idx "
         "ON proposal_evidence(surface, created_at)"
+    )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS provider_state (
+            provider_name TEXT PRIMARY KEY,
+            last_success_at TIMESTAMP,
+            last_failure_at TIMESTAMP,
+            last_failure_message TEXT,
+            consecutive_failures INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            failure_count INTEGER DEFAULT 0,
+            disabled_until TIMESTAMP,
+            notes TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )"""
+    )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS provider_seed_query_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_name TEXT NOT NULL,
+            seed_slug TEXT NOT NULL,
+            query_date DATE NOT NULL,
+            success INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(provider_name, seed_slug, query_date)
+        )"""
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS provider_seed_query_history_idx "
+        "ON provider_seed_query_history(provider_name, seed_slug, query_date)"
+    )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS subreddit_subscriber_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subreddit TEXT NOT NULL,
+            subscribers INTEGER NOT NULL,
+            snapshot_date DATE NOT NULL,
+            UNIQUE(subreddit, snapshot_date)
+        )"""
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS subreddit_subscriber_history_idx "
+        "ON subreddit_subscriber_history(subreddit, snapshot_date)"
     )
     db.commit()
 
@@ -540,11 +877,8 @@ def run_general_feed_discovery(db, limit=30, model="sonnet", dry_run=False):
 class GoogleRelatedProvider:
     """Provider wrapper for pytrends related/rising and daily trending calls."""
 
-    def __init__(self, geo="US", sleep_range=GOOGLE_RELATED_SLEEP_RANGE,
-                 backoff_seconds=60):
+    def __init__(self, geo="US"):
         self.geo = geo
-        self.sleep_range = sleep_range
-        self.backoff_seconds = backoff_seconds
         self._client = None
         self.rate_limited = False
 
@@ -561,30 +895,15 @@ class GoogleRelatedProvider:
             )
         return self._client
 
-    def _sleep(self):
-        low, high = self.sleep_range
-        if high <= 0:
-            return
-        time.sleep(random.uniform(low, high))
-
-    def _call_with_backoff(self, fn):
+    def _call(self, fn):
         if self.rate_limited:
             raise RuntimeError("Google Trends rate limited; skipping remaining calls")
-        last_exc = None
-        for attempt in range(2):
-            self._sleep()
-            try:
-                return fn()
-            except Exception as exc:
-                last_exc = exc
-                is_429 = "429" in str(exc) or "TooManyRequests" in type(exc).__name__
-                if is_429 and attempt == 0:
-                    time.sleep(self.backoff_seconds)
-                    continue
-                if is_429:
-                    self.rate_limited = True
-                raise
-        raise last_exc
+        try:
+            return fn()
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                self.rate_limited = True
+            raise
 
     def rising_for(self, query):
         def do_call():
@@ -592,7 +911,7 @@ class GoogleRelatedProvider:
             client.build_payload([query], timeframe="today 12-m", geo=self.geo)
             return client.related_queries()
 
-        data = self._call_with_backoff(do_call)
+        data = self._call(do_call)
         related = data.get(query) if isinstance(data, dict) else None
         if related is None and isinstance(data, dict) and data:
             related = next(iter(data.values()))
@@ -619,7 +938,7 @@ class GoogleRelatedProvider:
                         raise
             return client.trending_searches(pn="united_states")
 
-        df = self._call_with_backoff(do_call)
+        df = self._call(do_call)
         if df is None or getattr(df, "empty", False):
             return []
         values = []
@@ -639,6 +958,29 @@ def google_related_reject_reason(query, seed_slug, seed_query, skip_slugs):
     return None
 
 
+def provider_seed_queried_on(db, provider_name, seed_slug, query_date=None):
+    query_date = query_date or date.today().isoformat()
+    row = db.execute(
+        """SELECT id FROM provider_seed_query_history
+           WHERE provider_name=? AND seed_slug=? AND query_date=?""",
+        (provider_name, seed_slug, query_date),
+    ).fetchone()
+    return row is not None
+
+
+def record_provider_seed_query(db, provider_name, seed_slug, success=True, query_date=None):
+    query_date = query_date or date.today().isoformat()
+    db.execute(
+        """INSERT INTO provider_seed_query_history
+           (provider_name, seed_slug, query_date, success)
+           VALUES (?,?,?,?)
+           ON CONFLICT(provider_name, seed_slug, query_date)
+           DO UPDATE SET success=excluded.success""",
+        (provider_name, seed_slug, query_date, 1 if success else 0),
+    )
+    db.commit()
+
+
 def run_google_related_discovery(db, limit=30, dry_run=False, provider=None):
     """Discover adjacent proposals from Google Trends related/rising queries.
 
@@ -646,9 +988,14 @@ def run_google_related_discovery(db, limit=30, dry_run=False, provider=None):
     recall, filtered through a lightweight lifestyle keyword allowlist.
     """
     provider = provider or GoogleRelatedProvider()
+    related_state = ProviderState(db, "google_related_pytrends")
+    trending_state = ProviderState(db, "google_trending_pytrends")
     skip_slugs = existing_candidate_slugs(db) | existing_proposal_slugs(db)
     summary = {
         "seeds_scanned": 0,
+        "seeds_queried": 0,
+        "seeds_skipped_today": 0,
+        "provider_skipped": 0,
         "trending_checked": 0,
         "proposals_new": 0,
         "proposals_bumped": 0,
@@ -674,19 +1021,39 @@ def run_google_related_discovery(db, limit=30, dry_run=False, provider=None):
 
     print(f"discover.google_related: {len(rows)} trend seeds (dry_run={dry_run})")
     emitted = 0
+    max_seed_queries = google_related_max_seeds_per_run()
     for seed_slug, seed_name, category, seed_query in rows:
         if emitted >= limit:
             break
+        if summary["seeds_queried"] >= max_seed_queries:
+            print(f"  SKIP google_related: per-run seed cap reached ({max_seed_queries})")
+            break
         summary["seeds_scanned"] += 1
+        if provider_seed_queried_on(db, "google_related_pytrends", seed_slug):
+            summary["seeds_skipped_today"] += 1
+            continue
+        if not related_state.is_available():
+            summary["provider_skipped"] += 1
+            print(f"  SKIP google_related seed={seed_slug}: {related_state.unavailable_reason()}")
+            break
         try:
             rising = provider.rising_for(seed_query)
         except Exception as exc:
             summary["provider_errors"] += 1
+            msg = f"{type(exc).__name__}: {str(exc)[:500]}"
+            record_provider_seed_query(db, "google_related_pytrends", seed_slug, success=False)
+            if is_rate_limit_error(exc):
+                related_state.record_failure(msg, disable_minutes=1440, force_disable=True)
+            else:
+                related_state.record_failure(msg)
             print(f"  FAIL google_related seed={seed_slug}: {type(exc).__name__}: {str(exc)[:140]}",
                   file=sys.stderr)
             if "429" in str(exc) or "rate limited" in str(exc).lower():
                 break
-            continue
+            break
+        summary["seeds_queried"] += 1
+        related_state.record_success(notes=f"seed={seed_slug} query={seed_query}")
+        record_provider_seed_query(db, "google_related_pytrends", seed_slug, success=True)
 
         for raw_query, growth_value in rising:
             if emitted >= limit:
@@ -726,9 +1093,20 @@ def run_google_related_discovery(db, limit=30, dry_run=False, provider=None):
 
     if emitted < limit and not getattr(provider, "rate_limited", False):
         try:
-            trending = provider.trending_searches()
+            if not trending_state.is_available():
+                summary["provider_skipped"] += 1
+                print(f"  SKIP google_trending: {trending_state.unavailable_reason()}")
+                trending = []
+            else:
+                trending = provider.trending_searches()
+                trending_state.record_success(notes="daily trending searches")
         except Exception as exc:
             summary["provider_errors"] += 1
+            msg = f"{type(exc).__name__}: {str(exc)[:500]}"
+            if is_rate_limit_error(exc):
+                trending_state.record_failure(msg, disable_minutes=1440, force_disable=True)
+            else:
+                trending_state.record_failure(msg)
             print(f"  FAIL google_trending: {type(exc).__name__}: {str(exc)[:140]}",
                   file=sys.stderr)
             trending = []
@@ -787,18 +1165,29 @@ class TikTokCreativeProvider:
         self.period_days = period_days
         self.backoff_seconds = backoff_seconds
         self.session = session or requests.Session()
-        self.session.headers.update({
+        headers = {
             "User-Agent": BROWSER_UA,
             "Accept": "application/json,text/plain,text/html,*/*",
             "Referer": self.HTML_URL,
             "Origin": "https://ads.tiktok.com",
-        })
+        }
+        cookie = os.environ.get("TIKTOK_COOKIE", "").strip()
+        if cookie:
+            headers["Cookie"] = cookie
+        self.session.headers.update(headers)
+        self.last_error = ""
 
     def trending_hashtags(self, category, limit=30):
+        self.last_error = ""
         records = self._from_api(category, limit)
         if records:
             return records
-        return self._from_html(category, limit)
+        records = self._from_html(category, limit)
+        if records:
+            return records
+        if not self.last_error:
+            self.last_error = "empty TikTok Creative Center response"
+        return []
 
     def _from_api(self, category, limit):
         params = {
@@ -815,13 +1204,21 @@ class TikTokCreativeProvider:
             try:
                 response = self.session.get(endpoint, params=params, timeout=HTTP_TIMEOUT)
                 if response.status_code == 429:
+                    self.last_error = "429 Too Many Requests from TikTok Creative Center"
                     time.sleep(self.backoff_seconds)
                     response = self.session.get(endpoint, params=params, timeout=HTTP_TIMEOUT)
+                if response.status_code in (401, 403):
+                    self.last_error = (
+                        f"{response.status_code} Unauthorized - TIKTOK_COOKIE may have expired"
+                    )
+                    continue
                 response.raise_for_status()
                 payload = response.json()
-            except Exception:
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 continue
             if isinstance(payload, dict) and payload.get("code") not in (None, 0, 200, 40000):
+                self.last_error = f"TikTok API returned code={payload.get('code')}"
                 continue
             records = self._extract_hashtag_records(payload, category)
             if records:
@@ -832,10 +1229,17 @@ class TikTokCreativeProvider:
         try:
             response = self.session.get(self.HTML_URL, timeout=HTTP_TIMEOUT)
             if response.status_code == 429:
+                self.last_error = "429 Too Many Requests from TikTok Creative Center HTML"
                 time.sleep(self.backoff_seconds)
                 response = self.session.get(self.HTML_URL, timeout=HTTP_TIMEOUT)
+            if response.status_code in (401, 403):
+                self.last_error = (
+                    f"{response.status_code} Unauthorized - TIKTOK_COOKIE may have expired"
+                )
+                return []
             response.raise_for_status()
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {str(exc)[:300]}"
             return []
 
         match = re.search(
@@ -843,10 +1247,12 @@ class TikTokCreativeProvider:
             response.text,
         )
         if not match:
+            self.last_error = "TikTok HTML did not expose __NEXT_DATA__"
             return []
         try:
             payload = json.loads(match.group(1))
         except json.JSONDecodeError:
+            self.last_error = "TikTok HTML did not contain parseable __NEXT_DATA__"
             return []
         return self._extract_hashtag_records(payload, category)[:limit]
 
@@ -927,6 +1333,8 @@ def format_tiktok_evidence(record):
 
 def run_tiktok_creative_discovery(db, limit=30, dry_run=False, provider=None):
     provider = provider or TikTokCreativeProvider()
+    state = ProviderState(db, "tiktok_creative_center")
+    categories = tiktok_categories()
     skip_slugs = existing_candidate_slugs(db) | existing_proposal_slugs(db)
     summary = {
         "categories_scanned": 0,
@@ -939,21 +1347,37 @@ def run_tiktok_creative_discovery(db, limit=30, dry_run=False, provider=None):
         "filtered_length": 0,
         "filtered_platform_jargon": 0,
         "provider_errors": 0,
+        "provider_skipped": 0,
+        "empty_responses": 0,
     }
 
-    print(f"discover.tiktok: {len(TIKTOK_CREATIVE_CATEGORIES)} categories (dry_run={dry_run})")
+    print(f"discover.tiktok: {len(categories)} categories (dry_run={dry_run})")
     emitted = 0
-    for category in TIKTOK_CREATIVE_CATEGORIES:
+    for category in categories:
         if emitted >= limit:
+            break
+        if not state.is_available():
+            summary["provider_skipped"] += 1
+            print(f"  SKIP tiktok category={category}: {state.unavailable_reason()}")
             break
         summary["categories_scanned"] += 1
         try:
             records = provider.trending_hashtags(category, limit=limit)
         except Exception as exc:
             summary["provider_errors"] += 1
+            state.record_failure(f"{type(exc).__name__}: {str(exc)[:500]}")
             print(f"  FAIL tiktok category={category}: {type(exc).__name__}: {str(exc)[:140]}",
                   file=sys.stderr)
-            continue
+            break
+        if not records:
+            summary["empty_responses"] += 1
+            msg = getattr(provider, "last_error", "") or (
+                f"empty TikTok Creative Center response for category={category}"
+            )
+            state.record_failure(msg)
+            print(f"  SKIP tiktok category={category}: {msg}")
+            break
+        state.record_success(notes=f"category={category}")
 
         for record in records:
             if emitted >= limit:
@@ -1003,142 +1427,139 @@ def run_tiktok_creative_discovery(db, limit=30, dry_run=False, provider=None):
 
 # -- Reddit growing subreddit discovery adapter --------------------------
 
-class RedditGrowingProvider:
-    """Provider wrapper for official Reddit popular subs plus fallback lists."""
+def load_reddit_discovery_seeds(path=SOURCES_YAML):
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return []
+    seeds = []
+    for item in data.get("discovery_reddit_seeds", []) or []:
+        if not isinstance(item, dict):
+            continue
+        subreddit = normalize_subreddit_name(item.get("subreddit", ""))
+        if not subreddit:
+            continue
+        seeds.append({
+            "subreddit": subreddit,
+            "category": item.get("category") or "reddit_lifestyle",
+        })
+    return seeds
 
-    REDDIT_POPULAR_URL = "https://www.reddit.com/subreddits/popular.json"
-    SUBREDDITSTATS_URLS = (
-        "https://subredditstats.com/api/recently-popular",
-        "https://subredditstats.com/api/list/recently-popular",
-    )
 
-    def __init__(self, session=None, backoff_seconds=60):
+class RedditSubscriberDeltaProvider:
+    """Provider wrapper for watched-subreddit subscriber delta snapshots."""
+
+    ABOUT_URL = "https://www.reddit.com/r/{subreddit}/about.json"
+
+    def __init__(self, seeds=None, session=None):
+        self.seeds = seeds if seeds is not None else load_reddit_discovery_seeds()
         self.session = session or requests.Session()
         self.session.headers.update({
             "User-Agent": os.environ.get("SWELL_REDDIT_USER_AGENT", BROWSER_UA),
             "Accept": "application/json,text/plain,*/*",
         })
-        self.backoff_seconds = backoff_seconds
+        self.last_error = ""
+        self.stats = {
+            "watched": len(self.seeds),
+            "snapshots_recorded": 0,
+            "fetch_failures": 0,
+            "not_enough_history": 0,
+            "below_growth_threshold": 0,
+        }
 
-    def growing_subreddits(self, limit=30):
-        records = self._from_reddit_json(limit)
-        if records:
-            return records
-        records = self._from_praw(limit)
-        if records:
-            return records
-        return self._from_subredditstats(limit)
-
-    def _from_reddit_json(self, limit):
-        try:
-            response = self.session.get(
-                self.REDDIT_POPULAR_URL, params={"limit": limit}, timeout=HTTP_TIMEOUT
-            )
-            if response.status_code == 429:
-                time.sleep(self.backoff_seconds)
-                response = self.session.get(
-                    self.REDDIT_POPULAR_URL, params={"limit": limit}, timeout=HTTP_TIMEOUT
-                )
-            response.raise_for_status()
-            payload = response.json()
-        except Exception:
-            return []
-        children = payload.get("data", {}).get("children", [])
+    def emerging_subreddits(self, db, limit=30):
+        today = date.today().isoformat()
         out = []
-        for child in children:
-            data = child.get("data", {}) if isinstance(child, dict) else {}
-            name = data.get("display_name") or data.get("display_name_prefixed")
-            if not name:
+        self.last_error = ""
+        self.stats.update({
+            "watched": len(self.seeds),
+            "snapshots_recorded": 0,
+            "fetch_failures": 0,
+            "not_enough_history": 0,
+            "below_growth_threshold": 0,
+        })
+        for seed in self.seeds:
+            if len(out) >= limit:
+                break
+            subreddit = normalize_subreddit_name(seed.get("subreddit", ""))
+            if not subreddit:
                 continue
-            out.append({
-                "name": name,
-                "display_name_prefixed": data.get("display_name_prefixed") or f"r/{name}",
-                "description": data.get("public_description") or data.get("title") or "",
-                "subscribers": data.get("subscribers"),
-                "growth_rate": None,
-                "source": "reddit_popular",
-            })
-        return out
-
-    def _from_praw(self, limit):
-        try:
-            from ingest import reddit_credentials_present, reddit_client
-            if not reddit_credentials_present():
-                return []
-            reddit = reddit_client()
-            subs = reddit.subreddits.popular(limit=limit)
-        except Exception:
-            return []
-        out = []
-        for sub in subs:
-            out.append({
-                "name": getattr(sub, "display_name", ""),
-                "display_name_prefixed": getattr(sub, "display_name_prefixed", ""),
-                "description": (
-                    getattr(sub, "public_description", "") or
-                    getattr(sub, "title", "")
-                ),
-                "subscribers": getattr(sub, "subscribers", None),
-                "growth_rate": None,
-                "source": "reddit_praw_popular",
-            })
-        return [r for r in out if r["name"]]
-
-    def _from_subredditstats(self, limit):
-        for url in self.SUBREDDITSTATS_URLS:
             try:
-                response = self.session.get(url, timeout=HTTP_TIMEOUT)
-                if response.status_code == 429:
-                    time.sleep(self.backoff_seconds)
-                    response = self.session.get(url, timeout=HTTP_TIMEOUT)
-                response.raise_for_status()
-                payload = response.json()
-            except Exception:
+                record = self.fetch_about(subreddit)
+            except Exception as exc:
+                self.stats["fetch_failures"] += 1
+                self.last_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 continue
-            records = self._extract_stats_records(payload)
-            if records:
-                return records[:limit]
-        return []
+            if not record:
+                self.stats["fetch_failures"] += 1
+                if not self.last_error:
+                    self.last_error = f"empty Reddit about.json for r/{subreddit}"
+                continue
+            subscribers = record.get("subscribers")
+            try:
+                subscribers = int(subscribers)
+            except (TypeError, ValueError):
+                self.stats["fetch_failures"] += 1
+                self.last_error = f"missing subscriber count for r/{subreddit}"
+                continue
+            upsert_subreddit_snapshot(db, subreddit, subscribers, today)
+            self.stats["snapshots_recorded"] += 1
 
-    def _extract_stats_records(self, payload):
-        out = []
-        seen = set()
+            baseline = subreddit_baseline_snapshot(db, subreddit, today)
+            oldest = subreddit_oldest_snapshot_date(db, subreddit)
+            if not baseline or not oldest:
+                self.stats["not_enough_history"] += 1
+                continue
+            min_start = date.fromisoformat(today) - timedelta(days=REDDIT_SUBSCRIBER_MIN_HISTORY_DAYS)
+            if date.fromisoformat(oldest) > min_start:
+                self.stats["not_enough_history"] += 1
+                continue
+            baseline_date, baseline_subscribers = baseline
+            if not baseline_subscribers or baseline_subscribers <= 0:
+                self.stats["not_enough_history"] += 1
+                continue
+            growth_pct = ((subscribers - baseline_subscribers) / baseline_subscribers) * 100.0
+            if growth_pct <= REDDIT_SUBSCRIBER_GROWTH_THRESHOLD:
+                self.stats["below_growth_threshold"] += 1
+                continue
 
-        def walk(node):
-            if isinstance(node, dict):
-                name = (
-                    node.get("subreddit") or node.get("name") or
-                    node.get("display_name") or node.get("displayName")
-                )
-                if isinstance(name, str):
-                    clean = normalize_subreddit_name(name)
-                    if clean and clean not in seen:
-                        seen.add(clean)
-                        out.append({
-                            "name": clean,
-                            "display_name_prefixed": f"r/{clean}",
-                            "description": (
-                                node.get("description") or node.get("public_description") or
-                                node.get("title") or ""
-                            ),
-                            "subscribers": (
-                                node.get("subscribers") or node.get("subscriber_count") or
-                                node.get("subs")
-                            ),
-                            "growth_rate": (
-                                node.get("growth_rate") or node.get("growth") or
-                                node.get("growth_7d") or node.get("delta")
-                            ),
-                            "source": "subredditstats",
-                        })
-                for value in node.values():
-                    walk(value)
-            elif isinstance(node, list):
-                for item in node:
-                    walk(item)
-
-        walk(payload)
+            record.update({
+                "name": subreddit,
+                "display_name_prefixed": f"r/{subreddit}",
+                "subscribers": subscribers,
+                "growth_rate": growth_pct,
+                "growth_pct": growth_pct,
+                "baseline_date": baseline_date,
+                "baseline_subscribers": baseline_subscribers,
+                "category": seed.get("category") or "reddit_lifestyle",
+                "source": "reddit_subscriber_delta",
+            })
+            out.append(record)
+        db.commit()
         return out
+
+    def fetch_about(self, subreddit):
+        url = self.ABOUT_URL.format(subreddit=urllib.parse.quote(subreddit))
+        response = self.session.get(url, timeout=HTTP_TIMEOUT)
+        if response.status_code in (401, 403):
+            self.last_error = f"{response.status_code} from Reddit about.json for r/{subreddit}"
+            return None
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if not data:
+            return None
+        display_name = data.get("display_name") or subreddit
+        return {
+            "name": normalize_subreddit_name(display_name),
+            "display_name_prefixed": data.get("display_name_prefixed") or f"r/{display_name}",
+            "description": data.get("public_description") or data.get("title") or "",
+            "subscribers": data.get("subscribers"),
+        }
+
+
+RedditGrowingProvider = RedditSubscriberDeltaProvider
 
 
 def normalize_subreddit_name(raw):
@@ -1146,6 +1567,40 @@ def normalize_subreddit_name(raw):
     name = re.sub(r"^/?r/", "", name, flags=re.I)
     name = name.strip().strip("/")
     return re.sub(r"[^A-Za-z0-9_]", "", name).lower()
+
+
+def upsert_subreddit_snapshot(db, subreddit, subscribers, snapshot_date=None):
+    snapshot_date = snapshot_date or date.today().isoformat()
+    db.execute(
+        """INSERT INTO subreddit_subscriber_history
+           (subreddit, subscribers, snapshot_date)
+           VALUES (?,?,?)
+           ON CONFLICT(subreddit, snapshot_date)
+           DO UPDATE SET subscribers=excluded.subscribers""",
+        (normalize_subreddit_name(subreddit), int(subscribers), snapshot_date),
+    )
+
+
+def subreddit_oldest_snapshot_date(db, subreddit):
+    row = db.execute(
+        "SELECT MIN(snapshot_date) FROM subreddit_subscriber_history WHERE subreddit=?",
+        (normalize_subreddit_name(subreddit),),
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def subreddit_baseline_snapshot(db, subreddit, today=None):
+    today_date = date.fromisoformat(today) if isinstance(today, str) else (today or date.today())
+    target = (today_date - timedelta(days=7)).isoformat()
+    row = db.execute(
+        """SELECT snapshot_date, subscribers
+           FROM subreddit_subscriber_history
+           WHERE subreddit=? AND snapshot_date <= ?
+           ORDER BY snapshot_date DESC
+           LIMIT 1""",
+        (normalize_subreddit_name(subreddit), target),
+    ).fetchone()
+    return (row[0], row[1]) if row else None
 
 
 def reddit_growing_reject_reason(record, skip_slugs):
@@ -1184,10 +1639,14 @@ def format_reddit_evidence(record):
 
 
 def run_reddit_growing_discovery(db, limit=30, dry_run=False, provider=None):
-    provider = provider or RedditGrowingProvider()
+    provider = provider or RedditSubscriberDeltaProvider()
+    state = ProviderState(db, "reddit_subscriber_delta")
     skip_slugs = existing_candidate_slugs(db) | existing_proposal_slugs(db)
     summary = {
         "subreddits_checked": 0,
+        "snapshots_recorded": 0,
+        "not_enough_history": 0,
+        "below_growth_threshold": 0,
         "proposals_new": 0,
         "proposals_bumped": 0,
         "evidence_rows": 0,
@@ -1196,16 +1655,36 @@ def run_reddit_growing_discovery(db, limit=30, dry_run=False, provider=None):
         "filtered_generic": 0,
         "filtered_non_lifestyle": 0,
         "provider_errors": 0,
+        "provider_skipped": 0,
     }
 
-    print(f"discover.reddit_growing: fetching up to {limit} subreddits (dry_run={dry_run})")
-    try:
-        records = provider.growing_subreddits(limit=limit * 3)
-    except Exception as exc:
-        summary["provider_errors"] += 1
-        print(f"  FAIL reddit_growing: {type(exc).__name__}: {str(exc)[:140]}",
-              file=sys.stderr)
+    print(f"discover.reddit_growing: checking subscriber deltas (dry_run={dry_run})")
+    if not state.is_available():
+        summary["provider_skipped"] += 1
+        print(f"  SKIP reddit_growing: {state.unavailable_reason()}")
         records = []
+    else:
+        try:
+            if hasattr(provider, "emerging_subreddits"):
+                records = provider.emerging_subreddits(db, limit=limit * 3)
+                stats = getattr(provider, "stats", {}) or {}
+                summary["snapshots_recorded"] = stats.get("snapshots_recorded", 0)
+                summary["not_enough_history"] = stats.get("not_enough_history", 0)
+                summary["below_growth_threshold"] = stats.get("below_growth_threshold", 0)
+                if stats.get("snapshots_recorded", 0) > 0:
+                    state.record_success(notes=f"snapshots={stats.get('snapshots_recorded', 0)}")
+                else:
+                    msg = getattr(provider, "last_error", "") or "no Reddit subscriber snapshots recorded"
+                    state.record_failure(msg)
+            else:
+                records = provider.growing_subreddits(limit=limit * 3)
+                state.record_success(notes="legacy injected provider")
+        except Exception as exc:
+            summary["provider_errors"] += 1
+            state.record_failure(f"{type(exc).__name__}: {str(exc)[:500]}")
+            print(f"  FAIL reddit_growing: {type(exc).__name__}: {str(exc)[:140]}",
+                  file=sys.stderr)
+            records = []
 
     emitted = 0
     for record in records:
@@ -1235,8 +1714,8 @@ def run_reddit_growing_discovery(db, limit=30, dry_run=False, provider=None):
         outcome, _ = emit_structured_proposal(
             db, skip_slugs=skip_slugs, raw_slug=name,
             display_name=f"r/{name}",
-            category="reddit_lifestyle",
-            explanation="Growing or popular subreddit with lifestyle/physical keywords.",
+            category=record.get("category") or "reddit_lifestyle",
+            explanation="Watched subreddit with subscriber growth above the discovery threshold.",
             surface="reddit_growing",
             source_url=f"https://www.reddit.com/r/{name}/",
             raw_label=f"r/{name}",
@@ -1267,10 +1746,33 @@ def resolve_adapters(adapter_name):
     return [resolved]
 
 
+def provider_skip_summary(db, adapter):
+    provider_names = ADAPTER_PROVIDER_STATES.get(adapter, ())
+    if not provider_names:
+        return None
+    states = [ProviderState(db, name) for name in provider_names]
+    if not all(not state.is_available() for state in states):
+        return None
+    reasons = "; ".join(
+        f"{state.name}: {state.unavailable_reason()}" for state in states
+    )
+    return {
+        "provider_skipped": 1,
+        "skip_reason": reasons,
+        "proposals_new": 0,
+        "proposals_bumped": 0,
+        "evidence_rows": 0,
+    }
+
+
 def run_discovery_adapters(db, adapters, limit_per_adapter=30, model="sonnet", dry_run=False):
     summaries = {}
     for adapter in adapters:
-        if adapter == "general_feed":
+        skipped = provider_skip_summary(db, adapter)
+        if skipped is not None:
+            print(f"discover.{adapter}: SKIP {skipped['skip_reason']}")
+            summary = skipped
+        elif adapter == "general_feed":
             summary = run_general_feed_discovery(
                 db, limit=limit_per_adapter, model=model, dry_run=dry_run
             )
@@ -1295,6 +1797,48 @@ def run_discovery_adapters(db, adapters, limit_per_adapter=30, model="sonnet", d
 
 
 # -- CLI subcommands ------------------------------------------------------
+
+def provider_status_rows(db):
+    rows = []
+    for name in PROVIDER_POLICY:
+        state = ProviderState(db, name)
+        row = state.row()
+        rows.append((name, state, row))
+    return rows
+
+
+def show_provider_status(db):
+    rows = provider_status_rows(db)
+    print(f"{'provider':<28s} {'avail':<5s} {'last_success':<22s} "
+          f"{'fail':>4s} {'disabled_until':<22s} note")
+    for name, state, row in rows:
+        available = "yes" if state.is_available() else "no"
+        disabled = format_utc(row.get("disabled_until"))
+        if disabled == "never":
+            disabled = "-"
+        failures = int(row.get("consecutive_failures") or 0)
+        note = (
+            row.get("last_failure_message")
+            if failures > 0 else row.get("notes")
+        ) or ""
+        remaining = state.cooldown_remaining_seconds()
+        if remaining > 0 and not note:
+            note = state.unavailable_reason()
+        print(f"{name:<28s} {available:<5s} "
+              f"{format_utc(row.get('last_success_at')):<22s} "
+              f"{failures:>4d} "
+              f"{disabled:<22s} {str(note)[:120]}")
+
+
+def reset_provider(db, provider_name):
+    if provider_name not in PROVIDER_POLICY:
+        known = ", ".join(PROVIDER_POLICY)
+        print(f"discover: unknown provider '{provider_name}'. Known: {known}", file=sys.stderr)
+        return 1
+    ProviderState(db, provider_name).reset()
+    print(f"discover: provider reset: {provider_name}")
+    return 0
+
 
 def list_pending(db):
     rows = db.execute(
@@ -1478,6 +2022,10 @@ def main():
     ap.add_argument("--promote", type=int, default=None,
                     help="Create candidate row from approved proposal id "
                          "with status=observing")
+    ap.add_argument("--provider-status", action="store_true",
+                    help="Show provider cooldown/failure/circuit-breaker state")
+    ap.add_argument("--provider-reset", default=None,
+                    help="Clear disabled_until and failure count for one provider")
     ap.add_argument("--observation-days", type=int, default=OBSERVATION_DAYS,
                     help=f"Observation window after promotion (default {OBSERVATION_DAYS}d)")
     args = ap.parse_args()
@@ -1488,10 +2036,12 @@ def main():
 
     actions = [args.run, args.list_pending, args.show is not None,
                args.approve is not None, args.reject is not None,
-               args.promote is not None]
+               args.promote is not None, args.provider_status,
+               args.provider_reset is not None]
     if sum(bool(a) for a in actions) != 1:
         ap.error("specify exactly one of --run / --list-pending / --show / "
-                 "--approve / --reject / --promote")
+                 "--approve / --reject / --promote / --provider-status / "
+                 "--provider-reset")
 
     db = sqlite3.connect(args.db)
     ensure_discovery_schema(db)
@@ -1519,6 +2069,11 @@ def main():
         return update_proposal_status(db, args.reject, "rejected")
     if args.promote is not None:
         return promote_proposal(db, args.promote, args.observation_days)
+    if args.provider_status:
+        show_provider_status(db)
+        return 0
+    if args.provider_reset is not None:
+        return reset_provider(db, args.provider_reset)
 
     return 0
 

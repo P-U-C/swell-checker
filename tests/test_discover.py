@@ -18,7 +18,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -89,6 +89,51 @@ class FakeRedditProvider:
         return self.records
 
 
+class FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+        self.text = ""
+
+    def json(self):
+        return self.payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class FakeRedditAboutSession:
+    def __init__(self, payloads):
+        self.payloads = payloads
+        self.headers = {}
+
+    def get(self, url, timeout=20):
+        subreddit = url.rstrip("/").split("/")[-2].lower()
+        payload = self.payloads[subreddit]
+        if isinstance(payload, FakeResponse):
+            return payload
+        return FakeResponse(payload)
+
+
+def _about_payload(name, subscribers, description="social running club meetups"):
+    return {
+        "data": {
+            "display_name": name,
+            "display_name_prefixed": f"r/{name}",
+            "public_description": description,
+            "title": description,
+            "subscribers": subscribers,
+        }
+    }
+
+
+def _add_subreddit_history(db, subreddit, subscribers, days_ago):
+    snapshot = (date.today() - timedelta(days=days_ago)).isoformat()
+    discover.upsert_subreddit_snapshot(db, subreddit, subscribers, snapshot)
+    db.commit()
+
+
 class DiscoverSchemaTests(unittest.TestCase):
     def test_ensure_discovery_schema_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,6 +148,78 @@ class DiscoverSchemaTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertIn("proposed_candidates", tables)
             self.assertIn("proposal_evidence", tables)
+            self.assertIn("provider_state", tables)
+            self.assertIn("subreddit_subscriber_history", tables)
+
+
+class ProviderStateTests(unittest.TestCase):
+    def test_is_available_blocks_during_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _init_db(os.path.join(tmp, "db.sqlite"))
+            discover.ensure_discovery_schema(db)
+            state = discover.ProviderState(
+                db, "test_provider", policy={"cooldown_seconds": 90}
+            )
+
+            self.assertTrue(state.is_available())
+            state.record_success(notes="ok")
+
+            self.assertFalse(state.is_available())
+            self.assertGreater(state.cooldown_remaining_seconds(), 0)
+
+    def test_consecutive_failures_disables_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _init_db(os.path.join(tmp, "db.sqlite"))
+            discover.ensure_discovery_schema(db)
+            state = discover.ProviderState(
+                db,
+                "test_provider",
+                policy={"disable_threshold": 2, "disable_minutes": 60},
+            )
+
+            state.record_failure("first")
+            self.assertTrue(state.is_available())
+            state.record_failure("second")
+
+            self.assertFalse(state.is_available())
+            row = state.row()
+            self.assertEqual(row["consecutive_failures"], 2)
+            self.assertIsNotNone(row["disabled_until"])
+
+    def test_record_success_resets_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _init_db(os.path.join(tmp, "db.sqlite"))
+            discover.ensure_discovery_schema(db)
+            state = discover.ProviderState(
+                db,
+                "test_provider",
+                policy={"disable_threshold": 3, "disable_minutes": 60},
+            )
+            state.record_failure("first")
+            state.record_failure("second")
+
+            state.record_success(notes="recovered")
+
+            row = state.row()
+            self.assertEqual(row["consecutive_failures"], 0)
+            self.assertIsNone(row["disabled_until"])
+            self.assertEqual(row["success_count"], 1)
+
+    def test_disabled_provider_is_skipped_by_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _init_db(os.path.join(tmp, "db.sqlite"))
+            discover.ensure_discovery_schema(db)
+            state = discover.ProviderState(db, "tiktok_creative_center")
+            for _ in range(discover.PROVIDER_POLICY["tiktok_creative_center"]["disable_threshold"]):
+                state.record_failure("blocked")
+
+            with mock.patch("discover.TikTokCreativeProvider") as provider_cls:
+                summaries = discover.run_discovery_adapters(
+                    db, ["tiktok"], limit_per_adapter=5, dry_run=True
+                )
+
+            provider_cls.assert_not_called()
+            self.assertEqual(summaries["tiktok"]["provider_skipped"], 1)
 
 
 class SlugNormalizationTests(unittest.TestCase):
@@ -255,6 +372,79 @@ class AdapterFilterTests(unittest.TestCase):
 
             provider_cls.assert_called_once()
             provider.rising_for.assert_called_once_with("padel")
+
+
+class RedditSubscriberDeltaTests(unittest.TestCase):
+    def test_subscriber_delta_requires_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _init_db(os.path.join(tmp, "db.sqlite"))
+            discover.ensure_discovery_schema(db)
+            session = FakeRedditAboutSession({
+                "runclub": _about_payload("RunClub", 10_000),
+            })
+            provider = discover.RedditSubscriberDeltaProvider(
+                seeds=[{"subreddit": "RunClub", "category": "fitness_social"}],
+                session=session,
+            )
+
+            summary = discover.run_reddit_growing_discovery(
+                db, limit=5, dry_run=False, provider=provider
+            )
+
+            self.assertEqual(summary["proposals_new"], 0)
+            self.assertEqual(summary["not_enough_history"], 1)
+            count = db.execute(
+                "SELECT COUNT(*) FROM subreddit_subscriber_history WHERE subreddit=?",
+                ("runclub",),
+            ).fetchone()[0]
+            self.assertEqual(count, 1)
+
+    def test_subscriber_delta_emits_proposal_above_5pct_growth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _init_db(os.path.join(tmp, "db.sqlite"))
+            discover.ensure_discovery_schema(db)
+            _add_subreddit_history(db, "RunClub", 900, days_ago=14)
+            _add_subreddit_history(db, "RunClub", 1_000, days_ago=7)
+            session = FakeRedditAboutSession({
+                "runclub": _about_payload("RunClub", 1_061),
+            })
+            provider = discover.RedditSubscriberDeltaProvider(
+                seeds=[{"subreddit": "RunClub", "category": "fitness_social"}],
+                session=session,
+            )
+
+            summary = discover.run_reddit_growing_discovery(
+                db, limit=5, dry_run=False, provider=provider
+            )
+
+            self.assertEqual(summary["proposals_new"], 1)
+            row = db.execute(
+                "SELECT canonical_slug FROM proposed_candidates"
+            ).fetchone()
+            self.assertEqual(row[0], "runclub")
+
+    def test_subscriber_delta_no_emit_below_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _init_db(os.path.join(tmp, "db.sqlite"))
+            discover.ensure_discovery_schema(db)
+            _add_subreddit_history(db, "RunClub", 900, days_ago=14)
+            _add_subreddit_history(db, "RunClub", 1_000, days_ago=7)
+            session = FakeRedditAboutSession({
+                "runclub": _about_payload("RunClub", 1_040),
+            })
+            provider = discover.RedditSubscriberDeltaProvider(
+                seeds=[{"subreddit": "RunClub", "category": "fitness_social"}],
+                session=session,
+            )
+
+            summary = discover.run_reddit_growing_discovery(
+                db, limit=5, dry_run=False, provider=provider
+            )
+
+            self.assertEqual(summary["proposals_new"], 0)
+            self.assertEqual(summary["below_growth_threshold"], 1)
+            count = db.execute("SELECT COUNT(*) FROM proposed_candidates").fetchone()[0]
+            self.assertEqual(count, 0)
 
 
 class PromotionTests(unittest.TestCase):
