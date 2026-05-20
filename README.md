@@ -4,14 +4,20 @@ Autonomous trend-emergence detector. Watches a curated list of physical/lifestyl
 trends, extracts typed events from Reddit/RSS/News, scores them on a three-signal
 growth model (velocity + spread + vocabulary), emits a weekly watchlist to Telegram.
 
-**Current scope (v0):**
-- Curated candidate list (23 trends, edit `candidates.yaml`)
-- Physical/lifestyle trends only
-- Weekly Telegram watchlist digest plus pending assistant action intents
-- Shared VM + Telegram bot with peptide-corpus; distinguished by 🌊 prefix
+**Current scope:**
+- Seeded candidate list in `candidates.yaml` (count derived from the file,
+  not pinned in prose). Calibration anchors: pickleball, hyrox, axe_throwing,
+  crossfit, plus mature/post-peak/fizzled markers.
+- Physical / lifestyle trends only.
+- Weekly Telegram watchlist digest plus pending assistant action intents.
+- Shared VM + Telegram bot with peptide-corpus; distinguished by 🌊 prefix.
+- **Phase 2 discovery layer**: `discover.py` captures NEW trend candidates from
+  general-feed prose, operator-gated via `proposed_candidates` + `proposal_evidence`
+  tables (see `docs/phase-2-discovery-research.md`).
 
-**Deliberately deferred to Phase 2:**
-- Open discovery (auto-extracting candidate trends from prose)
+**Still deferred (Phase 2 next slices):**
+- Google related/rising query provider (next after general-feed discovery)
+- TikTok Creative Center adapter (interim public surface)
 - Thesis briefs (Opus-authored narratives for promoted candidates)
 - Threshold alerts (mid-week "candidate X just crossed")
 - Operator-build vs. investor-angle lens separation
@@ -21,7 +27,8 @@ growth model (velocity + spread + vocabulary), emits a weekly watchlist to Teleg
 ```
 swell-checker/
 ├── schema.sql           # SQLite schema
-├── candidates.yaml      # Seeded trends to track (22 trends in v0)
+├── candidates.yaml      # Seeded trends to track
+├── docs/                # Architecture refs (phase-2 discovery research)
 ├── sources.yaml         # Per-candidate source URLs
 ├── scorer_config.yaml   # Tunable scorer thresholds
 ├── seed.py              # Insert candidates from yaml (idempotent)
@@ -30,6 +37,8 @@ swell-checker/
 ├── scorer.py            # Compute composite scores (velocity + spread + vocabulary)
 ├── calibration.py       # Guardrail checks for known high/low calibration candidates
 ├── trend_router.py      # Convert fired scores into pending assistant action intents
+├── discover.py          # Phase 2: capture NEW trend candidates (operator-gated)
+├── tests/               # unittest suite
 ├── watchlist.py         # Weekly ranked digest
 ├── notify.py            # Telegram (shared bot with peptide-corpus, 🌊 prefix)
 ├── status.py            # Corpus health check
@@ -37,7 +46,10 @@ swell-checker/
 ├── cron-wrap.sh         # Cron wrapper with Telegram alerts on failure
 ├── crontab.example      # Per-user cron schedule for the assistant loop
 ├── run.sh               # Single-command entrypoint
-└── prompts/extract.md
+└── prompts/
+    ├── extract.md             # Per-candidate event extraction
+    ├── extract_general.md     # General-feed → known-candidate attribution
+    └── discover_general.md    # Phase 2: orphan-capture → new proposals
 ```
 
 ## First-run workflow
@@ -111,12 +123,41 @@ crontab crontab.example
 2. `spread` — operator + geographic events in trailing 24 months (log-scaled)
 3. `vocabulary` — positive/negative vocabulary events all-time
 
-**Composite** = 0.4·velocity + 0.4·spread + 0.2·vocabulary, damped by disruption penalty.
+**Composite** is a weighted sum damped by disruption penalty. Live weights live
+in `scorer_config.yaml` — currently spread-heavy at `velocity 0.25 / spread 0.55
+/ vocabulary 0.20` after the 2026-05-20 re-weighting (chatter alone — mention
+events — was saturating the velocity bucket on fizzled trends; spread/operator
+deployment is now the dominant signal). Inside velocity, event types are
+typed-weighted: `mention 0.30, media 1.0, cohort 2.0, funding 5.0, adjacent 0.5`.
 
-Fires at composite ≥ 0.55. Edit `scorer_config.yaml` to tune.
+Fires at composite ≥ `threshold` (0.55 by default). Edit `scorer_config.yaml` to tune.
 
 `python3 scorer.py` writes/upserts score snapshots by default. Use
 `python3 scorer.py --dry-run` for a non-persisting preview.
+
+## Discovery layer (Phase 2)
+
+The router only acts on the **curated** candidate list. The discovery layer
+captures candidates the operator hasn't named yet, from prose surfaces (general
+feeds today; Google related/rising and TikTok in later slices).
+
+Discovery writes to `proposed_candidates` + `proposal_evidence` tables — it
+**does not** touch the live watchlist until the operator promotes a proposal.
+The promotion creates a candidate with `status='observing'` and a
+`router_eligible_at` 28 days in the future, so newly-promoted candidates spend
+4 weeks accumulating signal before they can fire.
+
+```bash
+.venv/bin/python discover.py --run --limit 20     # scan general feeds
+.venv/bin/python discover.py --list-pending        # review queue
+.venv/bin/python discover.py --show 17             # full dossier for one
+.venv/bin/python discover.py --approve 17          # mark approved
+.venv/bin/python discover.py --reject 18           # mark rejected
+.venv/bin/python discover.py --promote 17          # create observing candidate
+```
+
+See `docs/phase-2-discovery-research.md` for the architectural rationale
+(sidecar proposal model, two-table dedup, observation gate, provider abstraction).
 
 ## Assistant router
 
