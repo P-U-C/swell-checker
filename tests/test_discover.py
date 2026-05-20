@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -28,7 +29,8 @@ import discover  # noqa: E402
 
 
 def _init_db(path):
-    schema = open(os.path.join(ROOT, "schema.sql")).read()
+    with open(os.path.join(ROOT, "schema.sql")) as f:
+        schema = f.read()
     db = sqlite3.connect(path)
     db.executescript(schema)
     # Seed the magic general candidate that the discovery layer needs
@@ -39,6 +41,52 @@ def _init_db(path):
     )
     db.commit()
     return db
+
+
+def _add_candidate_with_trends(db, slug="padel", display_name="Padel", category="sport",
+                               query="padel"):
+    db.execute(
+        "INSERT INTO candidates (slug, display_name, category, status) VALUES (?,?,?,?)",
+        (slug, display_name, category, "tracking"),
+    )
+    cid = db.execute("SELECT id FROM candidates WHERE slug=?", (slug,)).fetchone()[0]
+    db.execute(
+        "INSERT INTO sources (candidate_id, source_type, url, label) VALUES (?,?,?,?)",
+        (cid, "trends", query, f"Google Trends: {query}"),
+    )
+    db.commit()
+    return cid
+
+
+class FakeGoogleProvider:
+    def __init__(self, rising):
+        self.rising = rising
+        self.rising_calls = []
+
+    def rising_for(self, query):
+        self.rising_calls.append(query)
+        return self.rising
+
+    def trending_searches(self):
+        return []
+
+
+class FakeTikTokProvider:
+    def __init__(self, records):
+        self.records = records
+        self.calls = 0
+
+    def trending_hashtags(self, category, limit=30):
+        self.calls += 1
+        return self.records if self.calls == 1 else []
+
+
+class FakeRedditProvider:
+    def __init__(self, records):
+        self.records = records
+
+    def growing_subreddits(self, limit=30):
+        return self.records
 
 
 class DiscoverSchemaTests(unittest.TestCase):
@@ -108,6 +156,105 @@ class ProposalDedupTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(row[0], 3)
             self.assertEqual(row[1], "sound_bath")
+
+
+class AdapterFilterTests(unittest.TestCase):
+    def test_google_related_provider_filters_brand_noise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dbp = os.path.join(tmp, "db.sqlite")
+            db = _init_db(dbp)
+            discover.ensure_discovery_schema(db)
+            _add_candidate_with_trends(db, slug="padel", query="padel")
+            provider = FakeGoogleProvider([
+                ("padel court NYC", 250),
+                ("nike padel shoes", 1000),
+                ("padel near me", 500),
+            ])
+
+            summary = discover.run_google_related_discovery(
+                db, limit=10, dry_run=False, provider=provider)
+
+            self.assertEqual(summary["proposals_new"], 1)
+            rows = db.execute(
+                "SELECT canonical_slug FROM proposed_candidates ORDER BY canonical_slug"
+            ).fetchall()
+            self.assertEqual([r[0] for r in rows], ["padel_court_nyc"])
+
+    def test_google_related_skips_seed_synonyms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dbp = os.path.join(tmp, "db.sqlite")
+            db = _init_db(dbp)
+            discover.ensure_discovery_schema(db)
+            _add_candidate_with_trends(db, slug="padel", query="padel")
+            provider = FakeGoogleProvider([("padels", 300), ("padel", "Breakout")])
+
+            summary = discover.run_google_related_discovery(
+                db, limit=10, dry_run=False, provider=provider)
+
+            self.assertEqual(summary["proposals_new"], 0)
+            count = db.execute("SELECT COUNT(*) FROM proposed_candidates").fetchone()[0]
+            self.assertEqual(count, 0)
+
+    def test_tiktok_filters_platform_jargon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dbp = os.path.join(tmp, "db.sqlite")
+            db = _init_db(dbp)
+            discover.ensure_discovery_schema(db)
+            provider = FakeTikTokProvider([
+                {"hashtag": "fyp", "growth_pct": 1000},
+                {"hashtag": "viral", "growth_pct": 1000},
+                {"hashtag": "trending", "growth_pct": 1000},
+                {"hashtag": "hotgirlwalk", "growth_pct": 300, "view_count": 12_400_000},
+            ])
+
+            summary = discover.run_tiktok_creative_discovery(
+                db, limit=10, dry_run=False, provider=provider)
+
+            self.assertEqual(summary["proposals_new"], 1)
+            self.assertEqual(summary["filtered_platform_jargon"], 3)
+            row = db.execute(
+                "SELECT canonical_slug FROM proposed_candidates"
+            ).fetchone()
+            self.assertEqual(row[0], "hotgirlwalk")
+
+    def test_reddit_growing_filters_generic_subs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dbp = os.path.join(tmp, "db.sqlite")
+            db = _init_db(dbp)
+            discover.ensure_discovery_schema(db)
+            provider = FakeRedditProvider([
+                {"name": "all", "description": "all of reddit"},
+                {"name": "AskReddit", "description": "questions"},
+                {"name": "funny", "description": "humor"},
+                {"name": "runclub", "description": "social running club meetups",
+                 "subscribers": 42000, "growth_rate": 150},
+            ])
+
+            summary = discover.run_reddit_growing_discovery(
+                db, limit=10, dry_run=False, provider=provider)
+
+            self.assertEqual(summary["proposals_new"], 1)
+            self.assertEqual(summary["filtered_generic"], 3)
+            row = db.execute(
+                "SELECT canonical_slug FROM proposed_candidates"
+            ).fetchone()
+            self.assertEqual(row[0], "runclub")
+
+    def test_provider_abstraction_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dbp = os.path.join(tmp, "db.sqlite")
+            db = _init_db(dbp)
+            discover.ensure_discovery_schema(db)
+            _add_candidate_with_trends(db, slug="padel", query="padel")
+
+            with mock.patch("discover.GoogleRelatedProvider") as provider_cls:
+                provider = provider_cls.return_value
+                provider.rising_for.return_value = []
+                provider.trending_searches.return_value = []
+                discover.run_google_related_discovery(db, limit=10, dry_run=True)
+
+            provider_cls.assert_called_once()
+            provider.rising_for.assert_called_once_with("padel")
 
 
 class PromotionTests(unittest.TestCase):
