@@ -56,6 +56,14 @@ GOOGLE_TRENDING_LIFESTYLE_KEYWORDS = {
     "pilates", "sauna", "pickleball", "padel", "skincare", "makeup", "diet",
     "recipe", "coffee", "tea", "dance", "league", "tournament", "health",
 }
+TIKTOK_CREATIVE_CATEGORIES = (
+    "fitness", "beauty_personal_care", "lifestyle", "food_beverage",
+    "wellness_health",
+)
+TIKTOK_HASHTAG_STOPWORDS = {
+    "fyp", "foryou", "foryoupage", "viral", "trending", "trend", "xyzcba",
+    "tiktokmademebuyit", "tiktok", "duet", "stitch", "capcut",
+}
 HTTP_TIMEOUT = 20
 
 
@@ -302,6 +310,22 @@ def bump_summary(summary, outcome):
         summary["skipped_existing"] += 1
     elif outcome == "skipped_invalid":
         summary["skipped_invalid"] += 1
+
+
+def compact_count(value):
+    if value is None or value == "":
+        return "unknown"
+    try:
+        n = float(str(value).replace(",", ""))
+    except ValueError:
+        return str(value)
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{n:g}"
 
 
 # -- general-feed discovery adapter --------------------------------------
@@ -709,6 +733,237 @@ def run_google_related_discovery(db, limit=30, dry_run=False, provider=None):
     if not dry_run:
         db.commit()
     print(f"\ndiscover.google_related: {summary}")
+    return summary
+
+
+# -- TikTok Creative Center discovery adapter ----------------------------
+
+class TikTokCreativeProvider:
+    """Provider wrapper for TikTok Creative Center hashtag trend data."""
+
+    API_ENDPOINTS = (
+        "https://ads.tiktok.com/creative_radar_api/v1/popular_trend/hashtag/list",
+        "https://ads.tiktok.com/business/creativecenter/api/v1/inspiration/popular/hashtag/list",
+        "https://ads.tiktok.com/business/creativecenter/api/v1/inspiration/popular/hashtag/pc/list",
+    )
+    HTML_URL = "https://ads.tiktok.com/business/creativecenter/inspiration/popular/hashtag/pc/en"
+
+    def __init__(self, region="US", period_days=7, session=None, backoff_seconds=60):
+        self.region = region
+        self.period_days = period_days
+        self.backoff_seconds = backoff_seconds
+        self.session = session or requests.Session()
+        self.session.headers.update({
+            "User-Agent": BROWSER_UA,
+            "Accept": "application/json,text/plain,text/html,*/*",
+            "Referer": self.HTML_URL,
+            "Origin": "https://ads.tiktok.com",
+        })
+
+    def trending_hashtags(self, category, limit=30):
+        records = self._from_api(category, limit)
+        if records:
+            return records
+        return self._from_html(category, limit)
+
+    def _from_api(self, category, limit):
+        params = {
+            "period": self.period_days,
+            "country_code": self.region,
+            "region": self.region,
+            "category_name": category,
+            "industry_name": category,
+            "industry_id": category,
+            "page": 1,
+            "limit": limit,
+        }
+        for endpoint in self.API_ENDPOINTS:
+            try:
+                response = self.session.get(endpoint, params=params, timeout=HTTP_TIMEOUT)
+                if response.status_code == 429:
+                    time.sleep(self.backoff_seconds)
+                    response = self.session.get(endpoint, params=params, timeout=HTTP_TIMEOUT)
+                response.raise_for_status()
+                payload = response.json()
+            except Exception:
+                continue
+            if isinstance(payload, dict) and payload.get("code") not in (None, 0, 200, 40000):
+                continue
+            records = self._extract_hashtag_records(payload, category)
+            if records:
+                return records[:limit]
+        return []
+
+    def _from_html(self, category, limit):
+        try:
+            response = self.session.get(self.HTML_URL, timeout=HTTP_TIMEOUT)
+            if response.status_code == 429:
+                time.sleep(self.backoff_seconds)
+                response = self.session.get(self.HTML_URL, timeout=HTTP_TIMEOUT)
+            response.raise_for_status()
+        except Exception:
+            return []
+
+        match = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+            response.text,
+        )
+        if not match:
+            return []
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return []
+        return self._extract_hashtag_records(payload, category)[:limit]
+
+    def _extract_hashtag_records(self, payload, category):
+        out = []
+        seen = set()
+
+        def walk(node):
+            if isinstance(node, dict):
+                raw = (
+                    node.get("hashtag_name") or node.get("hashtag") or
+                    node.get("challenge_name") or node.get("keyword") or
+                    node.get("name") or node.get("title")
+                )
+                if isinstance(raw, str):
+                    tag = raw.lstrip("#").strip()
+                    if tag and tag.lower() not in seen:
+                        seen.add(tag.lower())
+                        out.append({
+                            "hashtag": tag,
+                            "growth_pct": (
+                                node.get("growth_pct") or node.get("growth") or
+                                node.get("growth_rate") or node.get("post_change") or
+                                node.get("publish_cnt_change") or
+                                node.get("index_change")
+                            ),
+                            "post_count": (
+                                node.get("post_count") or node.get("posts") or
+                                node.get("publish_cnt") or node.get("video_count")
+                            ),
+                            "view_count": (
+                                node.get("view_count") or node.get("views") or
+                                node.get("video_views") or node.get("hashtag_vv") or
+                                node.get("vv")
+                            ),
+                            "category": category,
+                            "source": "tiktok_creative_center",
+                        })
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(payload)
+        return out
+
+
+def tiktok_hashtag_reject_reason(hashtag, skip_slugs):
+    tag = (hashtag or "").lstrip("#").strip()
+    tag_lc = tag.lower()
+    if len(tag) < 4 or len(tag) > 35:
+        return "length"
+    if tag_lc in TIKTOK_HASHTAG_STOPWORDS:
+        return "platform_jargon"
+    if normalize_slug(tag) in skip_slugs:
+        return "existing"
+    return None
+
+
+def format_tiktok_evidence(record):
+    growth_value = record.get("growth_pct")
+    _, growth_label = parse_growth_value(growth_value)
+    if growth_label == "unknown":
+        growth_part = "Posts growth unknown / 7d"
+    elif growth_label == "Breakout":
+        growth_part = "Posts Breakout / 7d"
+    else:
+        growth_part = f"Posts +{growth_label} / 7d"
+    views = compact_count(record.get("view_count"))
+    if views != "unknown":
+        return f"{growth_part}, {views} views"
+    posts = compact_count(record.get("post_count"))
+    if posts != "unknown":
+        return f"{growth_part}, {posts} posts"
+    return growth_part
+
+
+def run_tiktok_creative_discovery(db, limit=30, dry_run=False, provider=None):
+    provider = provider or TikTokCreativeProvider()
+    skip_slugs = existing_candidate_slugs(db) | existing_proposal_slugs(db)
+    summary = {
+        "categories_scanned": 0,
+        "hashtags_checked": 0,
+        "proposals_new": 0,
+        "proposals_bumped": 0,
+        "evidence_rows": 0,
+        "skipped_existing": 0,
+        "skipped_invalid": 0,
+        "filtered_length": 0,
+        "filtered_platform_jargon": 0,
+        "provider_errors": 0,
+    }
+
+    print(f"discover.tiktok: {len(TIKTOK_CREATIVE_CATEGORIES)} categories (dry_run={dry_run})")
+    emitted = 0
+    for category in TIKTOK_CREATIVE_CATEGORIES:
+        if emitted >= limit:
+            break
+        summary["categories_scanned"] += 1
+        try:
+            records = provider.trending_hashtags(category, limit=limit)
+        except Exception as exc:
+            summary["provider_errors"] += 1
+            print(f"  FAIL tiktok category={category}: {type(exc).__name__}: {str(exc)[:140]}",
+                  file=sys.stderr)
+            continue
+
+        for record in records:
+            if emitted >= limit:
+                break
+            if isinstance(record, str):
+                record = {"hashtag": record, "category": category}
+            hashtag = (record.get("hashtag") or record.get("raw_label") or "").lstrip("#")
+            summary["hashtags_checked"] += 1
+            reason = tiktok_hashtag_reject_reason(hashtag, skip_slugs)
+            if reason == "length":
+                summary["filtered_length"] += 1
+                continue
+            if reason == "platform_jargon":
+                summary["filtered_platform_jargon"] += 1
+                continue
+            if reason == "existing":
+                summary["skipped_existing"] += 1
+                continue
+
+            conf = confidence_from_growth(record.get("growth_pct"))
+            if conf < 0.45:
+                conf = 0.45
+            raw_label = "#" + hashtag
+            outcome, _ = emit_structured_proposal(
+                db, skip_slugs=skip_slugs, raw_slug=hashtag,
+                display_name=display_name_from_label(hashtag),
+                category=(record.get("category") or category).replace("_", " "),
+                explanation="Trending TikTok Creative Center hashtag in a lifestyle category.",
+                surface="tiktok_creative_center",
+                source_url=TikTokCreativeProvider.HTML_URL,
+                raw_label=raw_label,
+                quote=format_tiktok_evidence(record),
+                confidence=conf,
+                dry_run=dry_run,
+                geo="US",
+                event_date=datetime.utcnow().strftime("%Y-%m-%d"),
+            )
+            bump_summary(summary, outcome)
+            if outcome in {"new", "bumped"}:
+                emitted += 1
+
+    if not dry_run:
+        db.commit()
+    print(f"\ndiscover.tiktok: {summary}")
     return summary
 
 
