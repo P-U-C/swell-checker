@@ -187,15 +187,40 @@ def main():
     db = sqlite3.connect(args.db)
     write_snapshot = not args.dry_run
 
+    # Score both 'tracking' candidates (seeded from yaml) and 'observing'
+    # candidates (promoted from the discovery layer; not yet router-
+    # eligible). The observation gate is enforced via would_fire below.
     candidates = db.execute(
-        "SELECT id, slug, display_name FROM candidates WHERE status='tracking' AND slug != '__general__' ORDER BY display_name"
+        "SELECT id, slug, display_name, status, router_eligible_at "
+        "FROM candidates "
+        "WHERE status IN ('tracking', 'observing') AND slug != '__general__' "
+        "ORDER BY display_name"
     ).fetchall()
 
     print(f"{'candidate':<40s} {'vel':>6} {'spr':>6} {'voc':>6} {'comp':>6}  fire?")
     written = 0
-    for cid, slug, name in candidates:
+    now = datetime.utcnow()
+    for cid, slug, name, status, router_eligible_at in candidates:
         s = score_candidate(db, cid, as_of, cfg)
-        fire = "YES" if s["would_fire"] else "-"
+        # Observation gate: 'observing' candidates and 'tracking'
+        # candidates whose router_eligible_at hasn't elapsed are scored
+        # but cannot fire. This is enforced HERE (not in trend_router)
+        # so the score snapshot accurately reflects routing eligibility.
+        if status == "observing":
+            s["would_fire"] = False
+            fire = "obs"
+        elif router_eligible_at:
+            try:
+                eligible = datetime.strptime(router_eligible_at[:19], "%Y-%m-%d %H:%M:%S")
+                if eligible > now:
+                    s["would_fire"] = False
+                    fire = "obs"
+                else:
+                    fire = "YES" if s["would_fire"] else "-"
+            except (ValueError, TypeError):
+                fire = "YES" if s["would_fire"] else "-"
+        else:
+            fire = "YES" if s["would_fire"] else "-"
         print(f"{name:<40s} {s['velocity']:>6.2f} {s['spread']:>6.2f} {s['vocabulary']:>6.2f} "
               f"{s['composite']:>6.3f}  {fire}")
         if write_snapshot:

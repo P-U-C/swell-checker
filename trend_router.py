@@ -51,29 +51,38 @@ def ensure_router_schema(db):
 
 
 def latest_score_rows(db, as_of=None):
+    # Routing requires: candidate is 'tracking' (not 'observing'), AND
+    # its router_eligible_at gate has either elapsed or was never set
+    # (legacy seeded-from-yaml rows). 'observing' candidates and rows
+    # within the post-promotion observation window stay off the router
+    # even if their composite score would otherwise fire.
+    where = (
+        "c.status='tracking' AND c.slug != '__general__' "
+        "AND (c.router_eligible_at IS NULL OR c.router_eligible_at <= CURRENT_TIMESTAMP)"
+    )
     if as_of:
         return db.execute(
-            """SELECT c.id, c.slug, c.display_name, c.category, COALESCE(c.stage, 'uncalibrated'),
-                      s.as_of, s.velocity, s.spread, s.vocabulary, s.composite, s.would_fire
-               FROM scores s
-               JOIN candidates c ON c.id=s.candidate_id
-               WHERE s.as_of=? AND c.status='tracking' AND c.slug != '__general__'
-               ORDER BY s.composite DESC""",
+            f"""SELECT c.id, c.slug, c.display_name, c.category, COALESCE(c.stage, 'uncalibrated'),
+                       s.as_of, s.velocity, s.spread, s.vocabulary, s.composite, s.would_fire
+                FROM scores s
+                JOIN candidates c ON c.id=s.candidate_id
+                WHERE s.as_of=? AND {where}
+                ORDER BY s.composite DESC""",
             (as_of,),
         ).fetchall()
 
     return db.execute(
-        """SELECT c.id, c.slug, c.display_name, c.category, COALESCE(c.stage, 'uncalibrated'),
-                  s.as_of, s.velocity, s.spread, s.vocabulary, s.composite, s.would_fire
-           FROM scores s
-           JOIN (
-             SELECT candidate_id, MAX(as_of) AS max_as_of
-             FROM scores
-             GROUP BY candidate_id
-           ) latest ON latest.candidate_id=s.candidate_id AND latest.max_as_of=s.as_of
-           JOIN candidates c ON c.id=s.candidate_id
-           WHERE c.status='tracking' AND c.slug != '__general__'
-           ORDER BY s.composite DESC"""
+        f"""SELECT c.id, c.slug, c.display_name, c.category, COALESCE(c.stage, 'uncalibrated'),
+                   s.as_of, s.velocity, s.spread, s.vocabulary, s.composite, s.would_fire
+            FROM scores s
+            JOIN (
+              SELECT candidate_id, MAX(as_of) AS max_as_of
+              FROM scores
+              GROUP BY candidate_id
+            ) latest ON latest.candidate_id=s.candidate_id AND latest.max_as_of=s.as_of
+            JOIN candidates c ON c.id=s.candidate_id
+            WHERE {where}
+            ORDER BY s.composite DESC"""
     ).fetchall()
 
 
