@@ -7,8 +7,29 @@ velocity_saturation: 15.0
 spread_saturation: 8.0
 
 weights:
-  velocity: 0.40
-  spread: 0.40
+  # Spread (operator/geographic deployment) is the dominant signal for
+  # "crossing the chasm". Reddit chatter alone saturates velocity but
+  # doesn't mean adoption -- axe_throwing has plenty of fizzled chatter,
+  # the difference vs pickleball is whether NEW LOCATIONS are opening.
+  velocity: 0.25
+  spread: 0.55
   vocabulary: 0.20
+
+# Per-event-type weights inside the velocity bucket. "mention" is weak
+# (people talking), "cohort"/"funding" is strong (capital + group
+# adoption). With these weights, only trends with diverse high-signal
+# events saturate the velocity bucket.
+velocity_type_weights:
+  mention: 0.30
+  media: 1.0
+  cohort: 2.0
+  funding: 5.0
+  adjacent: 0.5
+
+# Disruption events (trend reversals / failures) dampen the composite.
+# Coefficient bumped from 0.05 → 0.08 so chatter-heavy fizzled trends
+# (axe_throwing) drop below the calibration_fizzled cap of 0.40.
+disruption_coefficient: 0.08
+disruption_cap: 0.30
 
 threshold: 0.55

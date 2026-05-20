@@ -28,7 +28,23 @@ DEFAULT_CONFIG = {
     "spread_window_months": 24,
     "velocity_saturation": 15.0,
     "spread_saturation": 8.0,
-    "weights": {"velocity": 0.40, "spread": 0.40, "vocabulary": 0.20},
+    # Composite weights -- spread (operator/geographic deployment) is the
+    # strongest signal for "crossing the chasm". Reddit chatter alone
+    # (mention/adjacent) saturates velocity but doesn't mean a trend is
+    # being adopted -- axe_throwing has plenty of fizzled chatter, the
+    # difference is whether NEW LOCATIONS are opening.
+    "weights": {"velocity": 0.25, "spread": 0.55, "vocabulary": 0.20},
+    # Per-event-type weights inside the velocity bucket. "mention" is
+    # weak (people talking), "cohort"/"funding" is strong (capital +
+    # group adoption). Saturation stays at 15 so trends with diverse
+    # high-signal events still saturate.
+    "velocity_type_weights": {
+        "mention": 0.30,
+        "media": 1.0,
+        "cohort": 2.0,
+        "funding": 5.0,
+        "adjacent": 0.5,
+    },
     "threshold": 0.55,
 }
 
@@ -48,11 +64,22 @@ VELOCITY_TYPES = {"mention", "media", "cohort", "funding", "adjacent"}
 SPREAD_TYPES = {"operator", "geographic"}
 
 
-def velocity_score(events, saturation):
+def velocity_score(events, saturation, type_weights=None):
+    """Per-event-type weighted velocity.
+
+    Reddit chatter ("mention") dominates raw event counts but is the
+    weakest signal of real adoption. Capital deployment ("cohort" /
+    "funding") is the strongest. Without type weights, all mention-
+    heavy trends saturate velocity at 1.0 regardless of whether
+    they're actually crossing the chasm. With type weights, only
+    trends with diverse high-signal events saturate.
+    """
     weighted = 0.0
     for etype, mag, _date in events:
         if etype in VELOCITY_TYPES:
-            weighted += abs(mag) if mag < 10 else 1.0 + math.log10(abs(mag))
+            base = abs(mag) if mag < 10 else 1.0 + math.log10(abs(mag))
+            tw = (type_weights or {}).get(etype, 1.0)
+            weighted += base * tw
     return min(1.0, weighted / saturation)
 
 
@@ -77,12 +104,20 @@ def vocab_score(events):
     return max(0.0, min(1.0, positive / 2.0) - min(0.5, negative * 0.25))
 
 
-def disruption_penalty(events):
+def disruption_penalty(events, coefficient=0.08, cap=0.30):
+    """Penalty for disruption events (trend reversals / failures).
+
+    Bumped from 0.05 → 0.08 so that mention-heavy fizzled trends
+    (axe_throwing has 27 chatter mentions + 3 small disruptions)
+    get damped below the calibration cap rather than scoring 0.42.
+    Cap stays at 0.30 so a single bad year doesn't kill a trend
+    with otherwise strong operator signals.
+    """
     p = 0.0
     for etype, mag, _date in events:
         if etype == "disruption" and mag < 0:
-            p += abs(mag) * 0.05
-    return min(0.3, p)
+            p += abs(mag) * coefficient
+    return min(cap, p)
 
 
 def score_candidate(db, candidate_id, as_of, cfg):
@@ -98,10 +133,14 @@ def score_candidate(db, candidate_id, as_of, cfg):
     vel_events = [e for e in all_events if e[2] >= vel_start]
     spread_events = [e for e in all_events if e[2] >= spread_start]
 
-    vel = velocity_score(vel_events, cfg["velocity_saturation"])
+    vel = velocity_score(vel_events, cfg["velocity_saturation"], cfg.get("velocity_type_weights"))
     spread = spread_score(spread_events, cfg["spread_saturation"])
     vocab = vocab_score(all_events)
-    penalty = disruption_penalty(vel_events)
+    penalty = disruption_penalty(
+        vel_events,
+        coefficient=cfg.get("disruption_coefficient", 0.08),
+        cap=cfg.get("disruption_cap", 0.30),
+    )
 
     w = cfg["weights"]
     composite = (w["velocity"] * vel + w["spread"] * spread + w["vocabulary"] * vocab) * (1.0 - penalty)
