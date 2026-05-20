@@ -4,15 +4,20 @@
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
--- Tracked trends (seeded from candidates.yaml, can be added later)
+-- Tracked trends (seeded from candidates.yaml, or promoted from
+-- proposed_candidates by the discovery layer).
 CREATE TABLE IF NOT EXISTS candidates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slug TEXT UNIQUE NOT NULL,            -- e.g. "padel_us"
     display_name TEXT NOT NULL,           -- e.g. "Padel (US)"
     category TEXT NOT NULL,               -- e.g. "racquet_sport"
     stage TEXT DEFAULT 'uncalibrated',     -- approaching | very_early | calibration | calibration_fizzled
-    status TEXT DEFAULT 'tracking',       -- tracking | paused | promoted | dropped
+    status TEXT DEFAULT 'tracking',       -- tracking | observing | paused | promoted | dropped
     notes TEXT,
+    -- Newly-promoted candidates from the discovery layer are gated to
+    -- an observation window before becoming router-eligible. NULL means
+    -- immediately eligible (legacy / seeded-from-yaml rows).
+    router_eligible_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -88,3 +93,46 @@ CREATE TABLE IF NOT EXISTS router_events (
     UNIQUE(candidate_id, as_of, playbook)
 );
 CREATE INDEX IF NOT EXISTS router_events_status_idx ON router_events(route_status, created_at);
+
+-- Discovery layer (Phase 2): proposed candidates from prose / search /
+-- adjacent-query surfaces. Operator-gated; nothing routes off these
+-- until --promote moves them into the candidates table.
+--
+-- The two-table proposal+evidence model exists to cluster near-duplicates
+-- ("sound bath" vs "sound healing" vs "gong meditation") into one
+-- proposal with multiple evidence rows. See docs/phase-2-discovery-research.md.
+CREATE TABLE IF NOT EXISTS proposed_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_slug TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL,
+    category TEXT,
+    machine_explanation TEXT,
+    support_count INTEGER DEFAULT 0,
+    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    proposal_status TEXT DEFAULT 'pending_approval',
+    -- pending_approval | approved | rejected | promoted
+    promoted_candidate_id INTEGER REFERENCES candidates(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS proposed_candidates_status_idx
+    ON proposed_candidates(proposal_status, last_seen_at);
+
+CREATE TABLE IF NOT EXISTS proposal_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id INTEGER NOT NULL REFERENCES proposed_candidates(id) ON DELETE CASCADE,
+    surface TEXT NOT NULL,                -- general_feed | google_related | google_trending | tiktok
+    seed_slug TEXT,                       -- existing candidate slug, if discovery is adjacency-based
+    source_url TEXT,
+    raw_label TEXT,                       -- raw name as it appeared in the source
+    evidence_quote TEXT,                  -- verbatim from source
+    event_date DATE,
+    geo TEXT,
+    confidence REAL DEFAULT 0.5,
+    fetch_id INTEGER REFERENCES fetches(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS proposal_evidence_proposal_idx
+    ON proposal_evidence(proposal_id);
+CREATE INDEX IF NOT EXISTS proposal_evidence_surface_idx
+    ON proposal_evidence(surface, created_at);
