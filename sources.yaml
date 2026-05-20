@@ -28,11 +28,13 @@ sources:
     - {type: reddit, url: "https://old.reddit.com/r/padel/.json", label: "r/padel"}
     - {type: reddit, url: "https://old.reddit.com/r/padelusa/.json", label: "r/padelusa"}
     - {type: trends, url: "padel", label: "Google Trends: padel"}
+    - {type: places, url: "places://padel club", label: "Places: padel club"}
 
   run_clubs:
     - {type: reddit, url: "https://old.reddit.com/r/runclub/.json", label: "r/runclub"}
     - {type: reddit, url: "https://old.reddit.com/r/running/.json", label: "r/running (velocity baseline)"}
     - {type: trends, url: "run club", label: "Google Trends: run club"}
+    - {type: places, url: "places://run club", label: "Places: run club"}
 
   nordic_walking:
     - {type: reddit, url: "https://old.reddit.com/r/NordicWalking/.json", label: "r/NordicWalking"}
@@ -42,14 +44,17 @@ sources:
     - {type: reddit, url: "https://old.reddit.com/r/Coldplunge/.json", label: "r/Coldplunge"}
     - {type: reddit, url: "https://old.reddit.com/r/wimhof/.json", label: "r/wimhof"}
     - {type: trends, url: "cold plunge", label: "Google Trends: cold plunge"}
+    - {type: places, url: "places://cold plunge studio", label: "Places: cold plunge studio"}
 
   functional_fitness_smallbox:
     - {type: reddit, url: "https://old.reddit.com/r/functionalfitness/.json", label: "r/functionalfitness"}
     - {type: trends, url: "functional fitness gym", label: "Google Trends: functional fitness gym"}
+    - {type: places, url: "places://functional fitness gym", label: "Places: functional fitness gym"}
 
   sober_bars:
     - {type: reddit, url: "https://old.reddit.com/r/stopdrinking/.json", label: "r/stopdrinking (cohort)"}
     - {type: trends, url: "zero proof bar", label: "Google Trends: zero proof bar"}
+    - {type: places, url: "places://sober bar", label: "Places: sober bar"}
 
   rucking:
     - {type: reddit, url: "https://old.reddit.com/r/Rucking/.json", label: "r/Rucking"}
@@ -59,10 +64,12 @@ sources:
   climbing_urban:
     - {type: reddit, url: "https://old.reddit.com/r/bouldering/.json", label: "r/bouldering"}
     - {type: trends, url: "bouldering gym", label: "Google Trends: bouldering gym"}
+    - {type: places, url: "places://bouldering gym", label: "Places: bouldering gym"}
 
   f45_alternatives:
     - {type: reddit, url: "https://old.reddit.com/r/f45/.json", label: "r/f45"}
     - {type: trends, url: "group HIIT class", label: "Google Trends: group HIIT class"}
+    - {type: places, url: "places://HIIT gym", label: "Places: HIIT gym"}
 
   speed_golf:
     - {type: reddit, url: "https://old.reddit.com/r/speedgolf/.json", label: "r/speedgolf"}
@@ -71,10 +78,12 @@ sources:
   social_sauna:
     - {type: reddit, url: "https://old.reddit.com/r/Sauna/.json", label: "r/Sauna"}
     - {type: trends, url: "sauna club", label: "Google Trends: sauna club"}
+    - {type: places, url: "places://social sauna", label: "Places: social sauna"}
 
   mahjong_leagues:
     - {type: reddit, url: "https://old.reddit.com/r/Mahjong/.json", label: "r/Mahjong"}
     - {type: trends, url: "mahjong league", label: "Google Trends: mahjong league"}
+    - {type: places, url: "places://mahjong club", label: "Places: mahjong club"}
 
   dawn_patrol_fitness:
     - {type: trends, url: "dawn patrol fitness", label: "Google Trends: dawn patrol fitness"}
@@ -82,23 +91,28 @@ sources:
   longevity_clinics:
     - {type: reddit, url: "https://old.reddit.com/r/longevity/.json", label: "r/longevity"}
     - {type: trends, url: "longevity clinic", label: "Google Trends: longevity clinic"}
+    - {type: places, url: "places://longevity clinic", label: "Places: longevity clinic"}
 
   pilates_reformer:
     - {type: reddit, url: "https://old.reddit.com/r/pilates/.json", label: "r/pilates"}
     - {type: trends, url: "reformer pilates", label: "Google Trends: reformer pilates"}
+    - {type: places, url: "places://reformer pilates studio", label: "Places: reformer pilates studio"}
 
   breath_work:
     - {type: reddit, url: "https://old.reddit.com/r/Breathwork/.json", label: "r/Breathwork"}
     - {type: trends, url: "breathwork", label: "Google Trends: breathwork"}
+    - {type: places, url: "places://breathwork studio", label: "Places: breathwork studio"}
 
   # Calibration
   pickleball:
     - {type: reddit, url: "https://old.reddit.com/r/Pickleball/.json", label: "r/Pickleball"}
     - {type: trends, url: "pickleball", label: "Google Trends: pickleball"}
+    - {type: places, url: "places://pickleball club", label: "Places: pickleball club"}
 
   hyrox:
     - {type: reddit, url: "https://old.reddit.com/r/hyrox/.json", label: "r/hyrox"}
     - {type: trends, url: "hyrox", label: "Google Trends: hyrox"}
+    - {type: places, url: "places://hyrox gym", label: "Places: hyrox gym"}
 
   peloton:
     - {type: reddit, url: "https://old.reddit.com/r/pelotoncycle/.json", label: "r/pelotoncycle"}
@@ -110,11 +124,14 @@ sources:
   barre:
     - {type: reddit, url: "https://old.reddit.com/r/barre/.json", label: "r/barre"}
     - {type: trends, url: "barre class", label: "Google Trends: barre class"}
+    - {type: places, url: "places://barre studio", label: "Places: barre studio"}
 
   axe_throwing:
     - {type: reddit, url: "https://old.reddit.com/r/AxeThrowing/.json", label: "r/AxeThrowing"}
     - {type: trends, url: "axe throwing", label: "Google Trends: axe throwing"}
+    - {type: places, url: "places://axe throwing", label: "Places: axe throwing"}
 
   crossfit:
     - {type: reddit, url: "https://old.reddit.com/r/crossfit/.json", label: "r/crossfit"}
     - {type: trends, url: "crossfit", label: "Google Trends: crossfit"}
+    - {type: places, url: "places://crossfit gym", label: "Places: crossfit gym"}

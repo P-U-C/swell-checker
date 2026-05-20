@@ -261,6 +261,113 @@ def ensure_source_row(db, candidate_id: int, source_type: str, url: str, label: 
     return cur.lastrowid
 
 
+def fetch_places(query: str) -> str:
+    """Google Places Text Search across major US metros.
+
+    Accepts either a bare query ("padel club") or a places://-scheme
+    URI ("places://padel club"). The scheme prefix exists so the
+    sources.UNIQUE(candidate_id, url) constraint doesn't conflate
+    places with trends queries that share the same query string
+    (e.g. trends "axe throwing" vs places "axe throwing").
+
+    Returns formatted text the LLM can extract events from -- one line
+    per business with name + address + rating + price level. The count
+    + geographic distribution is the operator signal: e.g. "147 padel
+    clubs across 20 metros" is direct evidence of capital deployment,
+    impossible to get from Reddit chatter.
+
+    Requires GOOGLE_PLACES_API_KEY env var. Falls back gracefully if
+    missing (skipped sources, no crash).
+    """
+    if query.startswith("places://"):
+        query = query[len("places://"):]
+    api_key = os.environ.get("GOOGLE_PLACES_API_KEY") or os.environ.get("PLACES_API_KEY")
+    if not api_key:
+        return "[GOOGLE_PLACES_API_KEY not set - skipping places fetch]"
+
+    metros = [
+        "New York NY", "Los Angeles CA", "Chicago IL", "Houston TX",
+        "Phoenix AZ", "Philadelphia PA", "San Antonio TX", "San Diego CA",
+        "Dallas TX", "Austin TX", "Miami FL", "Atlanta GA",
+        "Seattle WA", "Denver CO", "Boston MA", "Portland OR",
+        "Nashville TN", "Charlotte NC", "Minneapolis MN", "San Francisco CA",
+    ]
+
+    operational = []
+    closed_perm = []
+    closed_temp = []
+    seen_place_ids = set()
+
+    for metro in metros:
+        try:
+            resp = requests.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params={"query": f"{query} {metro}", "key": api_key},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            status = data.get("status", "")
+            if status not in ("OK", "ZERO_RESULTS"):
+                return f"[Places API error: {status} - {data.get('error_message','')}]"
+            for r in data.get("results", []):
+                pid = r.get("place_id")
+                if not pid or pid in seen_place_ids:
+                    continue
+                seen_place_ids.add(pid)
+                rec = {
+                    "name": r.get("name", ""),
+                    "address": r.get("formatted_address", ""),
+                    "metro": metro,
+                    "rating": r.get("rating"),
+                    "user_ratings_total": r.get("user_ratings_total"),
+                    "business_status": r.get("business_status", "OPERATIONAL"),
+                }
+                bs = rec["business_status"]
+                if bs == "CLOSED_PERMANENTLY":
+                    closed_perm.append(rec)
+                elif bs == "CLOSED_TEMPORARILY":
+                    closed_temp.append(rec)
+                else:
+                    operational.append(rec)
+        except Exception:
+            # one metro failing shouldn't kill the whole fetch
+            continue
+
+    metros_active = len({r["metro"] for r in operational})
+    metros_closed = len({r["metro"] for r in closed_perm})
+
+    # Format with the disruption signal up front -- closed-permanently
+    # ratio is the key fizzle indicator. A trend with 388 operational
+    # locations is different from one with 200 operational + 188 closed.
+    out = [
+        f"QUERY: {query}",
+        f"OPERATIONAL_BUSINESSES: {len(operational)}",
+        f"CLOSED_PERMANENTLY: {len(closed_perm)}",
+        f"CLOSED_TEMPORARILY: {len(closed_temp)}",
+        f"METROS_WITH_OPERATIONAL: {metros_active} of {len(metros)}",
+        f"METROS_WITH_CLOSURES: {metros_closed}",
+        f"AS_OF: {datetime.utcnow().strftime('%Y-%m-%d')}",
+        "",
+    ]
+    # Closure rate is the fizzle proxy. A "this is being abandoned"
+    # signal that the LLM can convert into disruption events.
+    if len(operational) + len(closed_perm) > 0:
+        closure_rate = len(closed_perm) / (len(operational) + len(closed_perm))
+        out.append(f"CLOSURE_RATE: {closure_rate:.1%}  (perm closures / (operational + perm closures))")
+        out.append("")
+    out.append("OPERATIONAL BUSINESSES (open, accepting customers):")
+    for r in operational[:160]:
+        rating = f"{r['rating']}/5 ({r['user_ratings_total']} reviews)" if r["rating"] else "unrated"
+        out.append(f"  - {r['name']} | {r['address']} | {rating}")
+    if closed_perm:
+        out.append("")
+        out.append("CLOSED PERMANENTLY (operator capital lost):")
+        for r in closed_perm[:40]:
+            out.append(f"  - {r['name']} | {r['address']} | CLOSED")
+    return "\n".join(out)[:MAX_FETCH_BYTES]
+
+
 def fetch_one(src_type: str, url: str) -> str:
     if src_type == "reddit":
         return fetch_reddit(url)
@@ -268,6 +375,8 @@ def fetch_one(src_type: str, url: str) -> str:
         return fetch_rss(url)
     elif src_type == "trends":
         return fetch_trends(url)
+    elif src_type == "places":
+        return fetch_places(url)
     else:
         return f"[source type {src_type} not implemented]"
 
