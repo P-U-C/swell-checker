@@ -12,12 +12,14 @@ growth model (velocity + spread + vocabulary), emits a weekly watchlist to Teleg
 - Weekly Telegram watchlist digest plus pending assistant action intents.
 - Shared VM + Telegram bot with peptide-corpus; distinguished by 🌊 prefix.
 - **Phase 2 discovery layer**: `discover.py` captures NEW trend candidates from
-  general-feed prose, operator-gated via `proposed_candidates` + `proposal_evidence`
-  tables (see `docs/phase-2-discovery-research.md`).
+  general-feed prose, Google related/rising queries, TikTok Creative Center
+  hashtags, and Reddit growing-subreddit surfaces. Proposals are operator-gated
+  via `proposed_candidates` + `proposal_evidence` tables (see
+  `docs/phase-2-discovery-research.md`).
 
 **Still deferred (Phase 2 next slices):**
-- Google related/rising query provider (next after general-feed discovery)
-- TikTok Creative Center adapter (interim public surface)
+- Official Google Trends API replacement if/when related-query access exists
+- Better semantic duplicate clustering for word-order variants
 - Thesis briefs (Opus-authored narratives for promoted candidates)
 - Threshold alerts (mid-week "candidate X just crossed")
 - Operator-build vs. investor-angle lens separation
@@ -138,8 +140,14 @@ Fires at composite ≥ `threshold` (0.55 by default). Edit `scorer_config.yaml` 
 ## Discovery layer (Phase 2)
 
 The router only acts on the **curated** candidate list. The discovery layer
-captures candidates the operator hasn't named yet, from prose surfaces (general
-feeds today; Google related/rising and TikTok in later slices).
+captures candidates the operator hasn't named yet from four adapter surfaces:
+
+- `general_feed` — LLM pass over early-stage culture/lifestyle RSS fetches.
+- `google_related` — seed-adjacent Google Trends related/rising queries, plus
+  lower-confidence daily trending searches.
+- `tiktok` — TikTok Creative Center trending hashtags in lifestyle categories.
+- `reddit_growing` — popular/growing subreddits filtered through lifestyle
+  keywords; this is intentionally the noisiest discovery surface.
 
 Discovery writes to `proposed_candidates` + `proposal_evidence` tables — it
 **does not** touch the live watchlist until the operator promotes a proposal.
@@ -148,7 +156,10 @@ The promotion creates a candidate with `status='observing'` and a
 4 weeks accumulating signal before they can fire.
 
 ```bash
-.venv/bin/python discover.py --run --limit 20     # scan general feeds
+.venv/bin/python discover.py --run --limit-per-adapter 20
+.venv/bin/python discover.py --run --adapter google_related --dry-run --limit-per-adapter 5
+.venv/bin/python discover.py --run --adapter tiktok --dry-run --limit-per-adapter 5
+.venv/bin/python discover.py --run --adapter reddit_growing --dry-run --limit-per-adapter 5
 .venv/bin/python discover.py --list-pending        # review queue
 .venv/bin/python discover.py --show 17             # full dossier for one
 .venv/bin/python discover.py --approve 17          # mark approved
@@ -156,8 +167,12 @@ The promotion creates a candidate with `status='observing'` and a
 .venv/bin/python discover.py --promote 17          # create observing candidate
 ```
 
+`--limit` is still accepted as a backward-compatible alias for
+`--limit-per-adapter`.
+
 See `docs/phase-2-discovery-research.md` for the architectural rationale
 (sidecar proposal model, two-table dedup, observation gate, provider abstraction).
+See `docs/discovery-adapters.md` for adapter-specific notes.
 
 ## Assistant router
 

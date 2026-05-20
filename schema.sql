@@ -121,7 +121,7 @@ CREATE INDEX IF NOT EXISTS proposed_candidates_status_idx
 CREATE TABLE IF NOT EXISTS proposal_evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     proposal_id INTEGER NOT NULL REFERENCES proposed_candidates(id) ON DELETE CASCADE,
-    surface TEXT NOT NULL,                -- general_feed | google_related | google_trending | tiktok
+    surface TEXT NOT NULL,                -- general_feed | google_related | google_trending | tiktok_creative_center | reddit_growing
     seed_slug TEXT,                       -- existing candidate slug, if discovery is adjacency-based
     source_url TEXT,
     raw_label TEXT,                       -- raw name as it appeared in the source
