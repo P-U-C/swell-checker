@@ -546,6 +546,7 @@ class GoogleRelatedProvider:
         self.sleep_range = sleep_range
         self.backoff_seconds = backoff_seconds
         self._client = None
+        self.rate_limited = False
 
     def _trend_client(self):
         if self._client is None:
@@ -567,6 +568,8 @@ class GoogleRelatedProvider:
         time.sleep(random.uniform(low, high))
 
     def _call_with_backoff(self, fn):
+        if self.rate_limited:
+            raise RuntimeError("Google Trends rate limited; skipping remaining calls")
         last_exc = None
         for attempt in range(2):
             self._sleep()
@@ -574,9 +577,12 @@ class GoogleRelatedProvider:
                 return fn()
             except Exception as exc:
                 last_exc = exc
-                if "429" in str(exc) and attempt == 0:
+                is_429 = "429" in str(exc) or "TooManyRequests" in type(exc).__name__
+                if is_429 and attempt == 0:
                     time.sleep(self.backoff_seconds)
                     continue
+                if is_429:
+                    self.rate_limited = True
                 raise
         raise last_exc
 
@@ -606,7 +612,11 @@ class GoogleRelatedProvider:
         def do_call():
             client = self._trend_client()
             if hasattr(client, "today_searches"):
-                return client.today_searches(pn="united_states")
+                try:
+                    return client.today_searches(pn="united_states")
+                except Exception as exc:
+                    if "404" not in str(exc):
+                        raise
             return client.trending_searches(pn="united_states")
 
         df = self._call_with_backoff(do_call)
@@ -674,6 +684,8 @@ def run_google_related_discovery(db, limit=30, dry_run=False, provider=None):
             summary["provider_errors"] += 1
             print(f"  FAIL google_related seed={seed_slug}: {type(exc).__name__}: {str(exc)[:140]}",
                   file=sys.stderr)
+            if "429" in str(exc) or "rate limited" in str(exc).lower():
+                break
             continue
 
         for raw_query, growth_value in rising:
@@ -712,7 +724,7 @@ def run_google_related_discovery(db, limit=30, dry_run=False, provider=None):
             if outcome in {"new", "bumped"}:
                 emitted += 1
 
-    if emitted < limit:
+    if emitted < limit and not getattr(provider, "rate_limited", False):
         try:
             trending = provider.trending_searches()
         except Exception as exc:
