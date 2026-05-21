@@ -4,6 +4,16 @@ Autonomous trend-emergence detector. Watches a curated list of physical/lifestyl
 trends, extracts typed events from Reddit/RSS/News, scores them on a three-signal
 growth model (velocity + spread + vocabulary), emits a weekly watchlist to Telegram.
 
+## Where this sits in the system
+
+swell-checker is the **"what is rising"** corpus in the [Permanent Upper Class
+system](https://github.com/P-U-C). It feeds **Foreshore** — the health-sector
+trend brief in the `editorial` repo — and contributes to the machine-readable
+API. Sibling corpuses: **trend-corpus** (what is happening) and the planned
+**audience-corpus** (who you are talking to). Own the corpus; the newsletter is
+a thin surface on top. See the [org overview](https://github.com/P-U-C) for the
+full map.
+
 **Current scope:**
 - Seeded candidate list in `candidates.yaml` (count derived from the file,
   not pinned in prose). Calibration anchors: pickleball, hyrox, axe_throwing,
