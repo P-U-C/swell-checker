@@ -14,6 +14,17 @@ API. Sibling corpuses: **trend-corpus** (what is happening) and the planned
 a thin surface on top. See the [org overview](https://github.com/P-U-C) for the
 full map.
 
+### Roadmap (parked)
+
+A **[unified discovery + categorization layer](https://gist.github.com/0xzoz/e765ac337cc9cac479b3e88552187cc3)**
+is designed but deliberately parked. It extracts swell-checker's velocity /
+spread / vocabulary engine into shared infra that ingests broadly, then a
+categorizer/router buckets each emerging cluster (market → trend-corpus ·
+consumer/health → here · cohort → audience-corpus · macro → a new home · noise →
+discard). This is what would give trend-corpus open auto-discovery and dissolve
+the trend-corpus/swell-checker overlap. Build when breadth of coverage becomes
+the bottleneck — not before.
+
 **Current scope:**
 - Seeded candidate list in `candidates.yaml` (count derived from the file,
   not pinned in prose). Calibration anchors: pickleball, hyrox, axe_throwing,
