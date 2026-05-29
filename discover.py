@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import json
+import html
 import sqlite3
 import subprocess
 import argparse
@@ -124,6 +125,30 @@ ADAPTER_ALIASES = {
     "reddit": "reddit_growing",
     "reddit_growing": "reddit_growing",
 }
+GENERAL_HEURISTIC_KEYWORDS = {
+    "at-home", "barre", "beauty", "breathwork", "climbing", "cold plunge",
+    "community", "creatine", "dating", "fermentation", "fitness", "glp",
+    "health", "hiking", "longevity", "menopause", "nutrition", "padel",
+    "peptide", "pickleball", "pilates", "protein", "run club", "running",
+    "sauna", "skincare", "sleep", "sober", "supplement", "therapy",
+    "training", "walking", "wellness", "workout", "yoga",
+}
+GENERAL_HEURISTIC_REJECT_KEYWORDS = {
+    "election", "game industry", "rockstar game", "stock market", "ukraine",
+    "war",
+}
+GENERAL_HEURISTIC_CATEGORY_KEYWORDS = (
+    ("beauty_tech", {"led", "skincare", "beauty", "makeup", "facial"}),
+    ("boutique_fitness", {"barre", "pilates", "yoga", "workout", "training"}),
+    ("fitness_social", {"run club", "running", "walking", "community"}),
+    ("fitness_outdoor", {"climbing", "hiking", "bouldering", "outdoor"}),
+    ("health_optimization", {
+        "creatine", "glp", "health", "longevity", "menopause", "nutrition",
+        "peptide", "protein", "supplement", "therapy", "wellness",
+    }),
+    ("food_beverage", {"coffee", "tea", "fermentation", "recipe"}),
+    ("sober_social", {"sober", "sobriety", "stopdrinking"}),
+)
 
 
 class AuthError(RuntimeError):
@@ -770,13 +795,171 @@ def insert_evidence(db, proposal_id, surface, source_url, raw_label, quote,
     )
 
 
+def clean_feed_text(value):
+    value = html.unescape(value or "")
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def feed_item_chunks(raw_text):
+    for chunk in re.split(r"\s+---\s+", raw_text or ""):
+        chunk = chunk.strip()
+        if chunk:
+            yield chunk
+
+
+def parse_general_feed_item(chunk):
+    title = ""
+    date_text = ""
+    desc = ""
+
+    title_match = re.search(r"\bTITLE:\s*(.*?)(?:\s+DATE:|\s+DESC:|$)", chunk, re.S)
+    if title_match:
+        title = clean_feed_text(title_match.group(1))
+    date_match = re.search(r"\bDATE:\s*(.*?)(?:\s+DESC:|$)", chunk, re.S)
+    if date_match:
+        date_text = clean_feed_text(date_match.group(1))
+    desc_match = re.search(r"\bDESC:\s*(.*)$", chunk, re.S)
+    if desc_match:
+        desc = clean_feed_text(desc_match.group(1))
+
+    if not title and not desc:
+        return None
+    return {"title": title, "date_text": date_text, "description": desc}
+
+
+def keyword_hits(text, keywords):
+    text_lc = (text or "").lower()
+    hits = []
+    for keyword in sorted(keywords, key=len, reverse=True):
+        keyword_lc = keyword.lower()
+        if " " in keyword_lc or "-" in keyword_lc:
+            if keyword_lc in text_lc:
+                hits.append(keyword)
+        elif re.search(rf"\b{re.escape(keyword_lc)}\b", text_lc):
+            hits.append(keyword)
+    return hits
+
+
+def title_segment_with_hits(title, hits):
+    title = clean_feed_text(title)
+    if not title:
+        return ""
+    segments = [
+        segment.strip()
+        for segment in re.split(r"\s+(?:[-\u2013\u2014]|:)\s+|[;|]", title)
+        if segment.strip()
+    ]
+    for segment in segments:
+        if keyword_hits(segment, hits):
+            return segment
+    return title
+
+
+def heuristic_general_label(title, description, hits):
+    label = title_segment_with_hits(title, hits)
+    if not label:
+        label = title_segment_with_hits(description, hits)
+    label = re.sub(
+        r"^(inside|why|how|what|the|a|an|all|guide to|in defense of)\s+",
+        "",
+        label,
+        flags=re.I,
+    )
+    label = re.sub(
+        r"\b(?:are|is|was|were)\s+(?:taking over|everywhere|the new|now|back)\b.*",
+        "",
+        label,
+        flags=re.I,
+    )
+    label = re.sub(r"\b(?:taking over|goes mainstream)\b.*", "", label, flags=re.I)
+    label = re.sub(r"\s+", " ", label).strip(" -" + "\u2013\u2014" + ":;,.")
+    words = label.split()
+    if len(words) > 8:
+        label = " ".join(words[:8]).strip(" -" + "\u2013\u2014" + ":;,.")
+    return label
+
+
+def heuristic_general_category(text):
+    text_lc = (text or "").lower()
+    for category, keywords in GENERAL_HEURISTIC_CATEGORY_KEYWORDS:
+        if keyword_hits(text_lc, keywords):
+            return category
+    return "lifestyle"
+
+
+def general_feed_event_date(item, fetched_at):
+    raw = " ".join([item.get("date_text") or "", fetched_at or ""])
+    iso = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", raw)
+    if iso:
+        return iso.group(1)
+    if fetched_at:
+        return str(fetched_at).split(" ")[0]
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def heuristic_general_feed_proposals(text, fetched_at, src_label):
+    """Conservative no-LLM fallback for general-feed discovery.
+
+    This is intentionally lower-recall than the Claude prompt. It only emits
+    article-title proposals when the title/description contains explicit
+    health, fitness, beauty, food, or lifestyle keywords.
+    """
+    proposals = []
+    seen = set()
+    for chunk in feed_item_chunks(text):
+        item = parse_general_feed_item(chunk)
+        if not item:
+            continue
+        haystack = " ".join([
+            item.get("title") or "",
+            item.get("description") or "",
+            src_label or "",
+        ])
+        if keyword_hits(haystack, GENERAL_HEURISTIC_REJECT_KEYWORDS):
+            continue
+        hits = keyword_hits(haystack, GENERAL_HEURISTIC_KEYWORDS)
+        if not hits:
+            continue
+        label = heuristic_general_label(
+            item.get("title") or "",
+            item.get("description") or "",
+            hits,
+        )
+        canonical = normalize_slug(label)
+        if not canonical or canonical in seen:
+            continue
+        seen.add(canonical)
+        desc = item.get("description") or ""
+        quote = item.get("title") or label
+        if desc:
+            quote = f"{quote} -- {desc[:260]}"
+        confidence = min(0.5, 0.32 + (0.06 * min(len(hits), 3)))
+        proposals.append({
+            "type": "proposal",
+            "canonical_slug": canonical,
+            "display_name": display_name_from_label(label),
+            "category": heuristic_general_category(haystack),
+            "rationale": (
+                "No-LLM heuristic matched explicit discovery keywords: "
+                + ", ".join(hits[:5])
+            ),
+            "evidence_quote": quote,
+            "event_date": general_feed_event_date(item, fetched_at),
+            "confidence": confidence,
+        })
+    return proposals
+
+
 # -- runner --------------------------------------------------------------
 
-def run_general_feed_discovery(db, limit=30, model="sonnet", dry_run=False):
+def run_general_feed_discovery(db, limit=30, model="sonnet", dry_run=False,
+                               no_claude=False):
     """Read unprocessed general-feed fetches, run LLM discovery prompt,
     write proposals + evidence. Returns summary dict."""
-    prompt_template = load_prompt(PROMPT_DISCOVER_GENERAL)
-    tracked_slugs_block = build_tracked_slugs_block(db)
+    prompt_template = None if no_claude else load_prompt(PROMPT_DISCOVER_GENERAL)
+    tracked_slugs_block = "" if no_claude else build_tracked_slugs_block(db)
     skip_slugs = existing_candidate_slugs(db) | existing_proposal_slugs(db)
 
     # general-feed fetches are owned by the __general__ candidate
@@ -795,43 +978,78 @@ def run_general_feed_discovery(db, limit=30, model="sonnet", dry_run=False):
         (GENERAL_CANDIDATE_SLUG, limit),
     ).fetchall()
 
-    print(f"discover.general_feed: {len(rows)} fetches to scan (dry_run={dry_run})")
-    proposals_new = 0
-    proposals_bumped = 0
-    evidence_rows = 0
-    skipped_existing = 0
+    print(f"discover.general_feed: {len(rows)} fetches to scan "
+          f"(dry_run={dry_run}, no_claude={no_claude})")
+    summary = {
+        "fetches_scanned": len(rows),
+        "fetches_claude": 0,
+        "fetches_heuristic": 0,
+        "claude_auth_failures": 0,
+        "claude_runtime_errors": 0,
+        "proposals_new": 0,
+        "proposals_bumped": 0,
+        "evidence_rows": 0,
+        "skipped_existing": 0,
+        "skipped_invalid": 0,
+    }
+    claude_disabled = bool(no_claude)
 
     for fid, text, fetched_at, src_url, src_label in rows:
-        prompt = (
-            prompt_template
-            .replace("{source_label}", src_label or "")
-            .replace("{source_url}", src_url or "")
-            .replace("{fetch_date}", (fetched_at or "").split(" ")[0])
-            .replace("{tracked_slugs_block}", tracked_slugs_block)
-            .replace("{text}", (text or "")[:SOURCE_TEXT_CAP])
-        )
-        try:
-            output = run_claude(prompt, model=model)
-        except AuthError as e:
-            print(f"\nFATAL: {e}", file=sys.stderr)
-            print("Aborting; re-login as this user and retry.", file=sys.stderr)
-            return None
-        except (subprocess.TimeoutExpired, RuntimeError) as e:
-            print(f"  FAIL fetch {fid}: {e}", file=sys.stderr)
-            continue
+        proposals = []
+        used_heuristic = False
+        if claude_disabled:
+            proposals = heuristic_general_feed_proposals(text, fetched_at, src_label)
+            summary["fetches_heuristic"] += 1
+            used_heuristic = True
+        else:
+            prompt = (
+                prompt_template
+                .replace("{source_label}", src_label or "")
+                .replace("{source_url}", src_url or "")
+                .replace("{fetch_date}", (fetched_at or "").split(" ")[0])
+                .replace("{tracked_slugs_block}", tracked_slugs_block)
+                .replace("{text}", (text or "")[:SOURCE_TEXT_CAP])
+            )
+            try:
+                output = run_claude(prompt, model=model)
+                summary["fetches_claude"] += 1
+                proposals = list(parse_proposals(output))
+            except AuthError as exc:
+                summary["claude_auth_failures"] += 1
+                claude_disabled = True
+                used_heuristic = True
+                proposals = heuristic_general_feed_proposals(text, fetched_at, src_label)
+                summary["fetches_heuristic"] += 1
+                print(
+                    f"  WARN general_feed fetch {fid}: {exc}; "
+                    "using heuristic fallback for remaining fetches",
+                    file=sys.stderr,
+                )
+            except (subprocess.TimeoutExpired, RuntimeError, OSError) as exc:
+                summary["claude_runtime_errors"] += 1
+                used_heuristic = True
+                proposals = heuristic_general_feed_proposals(text, fetched_at, src_label)
+                summary["fetches_heuristic"] += 1
+                print(
+                    f"  WARN general_feed fetch {fid}: {exc}; "
+                    "using heuristic fallback for this fetch",
+                    file=sys.stderr,
+                )
 
         per_fetch = 0
-        for obj in parse_proposals(output):
+        for obj in proposals:
             slug = obj.get("canonical_slug", "")
             display = obj.get("display_name", "").strip()
             canonical = normalize_slug(slug or display)
             if not canonical:
+                summary["skipped_invalid"] += 1
                 continue
             if canonical in skip_slugs:
-                skipped_existing += 1
+                summary["skipped_existing"] += 1
                 continue
             if dry_run:
-                proposals_new += 1
+                summary["proposals_new"] += 1
+                skip_slugs.add(canonical)
                 print(f"  [proposal] {canonical:<28s} {display[:40]:<40s} "
                       f"conf={obj.get('confidence', 0.5):.2f}  src={src_label}")
                 continue
@@ -840,6 +1058,7 @@ def run_general_feed_discovery(db, limit=30, model="sonnet", dry_run=False):
                 obj.get("rationale", "")
             )
             if pid is None:
+                summary["skipped_invalid"] += 1
                 continue
             insert_evidence(
                 db, pid, surface="general_feed",
@@ -849,25 +1068,19 @@ def run_general_feed_discovery(db, limit=30, model="sonnet", dry_run=False):
                 confidence=obj.get("confidence", 0.5),
                 fetch_id=fid,
             )
-            evidence_rows += 1
+            summary["evidence_rows"] += 1
             if is_new:
-                proposals_new += 1
+                summary["proposals_new"] += 1
                 skip_slugs.add(canonical)
             else:
-                proposals_bumped += 1
+                summary["proposals_bumped"] += 1
             per_fetch += 1
 
-        print(f"  ok fetch {fid}: {per_fetch} proposals  [{src_label}]")
+        mode = "heuristic" if used_heuristic else "claude"
+        print(f"  ok fetch {fid}: {per_fetch} proposals via {mode}  [{src_label}]")
         if not dry_run:
             db.commit()
 
-    summary = {
-        "fetches_scanned": len(rows),
-        "proposals_new": proposals_new,
-        "proposals_bumped": proposals_bumped,
-        "evidence_rows": evidence_rows,
-        "skipped_existing": skipped_existing,
-    }
     print(f"\ndiscover.general_feed: {summary}")
     return summary
 
@@ -1757,6 +1970,7 @@ def provider_skip_summary(db, adapter):
         f"{state.name}: {state.unavailable_reason()}" for state in states
     )
     return {
+        "adapter_status": "skipped",
         "provider_skipped": 1,
         "skip_reason": reasons,
         "proposals_new": 0,
@@ -1765,34 +1979,88 @@ def provider_skip_summary(db, adapter):
     }
 
 
-def run_discovery_adapters(db, adapters, limit_per_adapter=30, model="sonnet", dry_run=False):
+def adapter_failure_summary(exc):
+    return {
+        "adapter_status": "failed",
+        "error_type": type(exc).__name__,
+        "error_message": str(exc)[:500],
+        "proposals_new": 0,
+        "proposals_bumped": 0,
+        "evidence_rows": 0,
+    }
+
+
+def adapter_summary_failed(summary):
+    return bool(summary and summary.get("adapter_status") == "failed")
+
+
+def discovery_run_exit_code(summaries):
+    if not summaries:
+        return 2
+    if all(adapter_summary_failed(summary) for summary in summaries.values()):
+        return 2
+    return 0
+
+
+def print_discovery_run_summary(summaries):
+    print("\ndiscover.run: adapter summary")
+    for adapter, summary in summaries.items():
+        summary = summary or {}
+        status = summary.get("adapter_status", "ok")
+        new = int(summary.get("proposals_new") or 0)
+        bumped = int(summary.get("proposals_bumped") or 0)
+        evidence = int(summary.get("evidence_rows") or 0)
+        extra = ""
+        if status == "failed":
+            extra = f" error={summary.get('error_type')}: {summary.get('error_message')}"
+        elif summary.get("skip_reason"):
+            extra = f" reason={summary.get('skip_reason')}"
+        print(
+            f"  {adapter:<16s} status={status:<7s} "
+            f"new={new:<3d} bumped={bumped:<3d} evidence={evidence:<3d}{extra}"
+        )
+
+
+def run_discovery_adapters(db, adapters, limit_per_adapter=30, model="sonnet",
+                           dry_run=False, no_claude=False):
     summaries = {}
     for adapter in adapters:
         skipped = provider_skip_summary(db, adapter)
         if skipped is not None:
             print(f"discover.{adapter}: SKIP {skipped['skip_reason']}")
             summary = skipped
-        elif adapter == "general_feed":
-            summary = run_general_feed_discovery(
-                db, limit=limit_per_adapter, model=model, dry_run=dry_run
-            )
-        elif adapter == "google_related":
-            summary = run_google_related_discovery(
-                db, limit=limit_per_adapter, dry_run=dry_run
-            )
-        elif adapter == "tiktok":
-            summary = run_tiktok_creative_discovery(
-                db, limit=limit_per_adapter, dry_run=dry_run
-            )
-        elif adapter == "reddit_growing":
-            summary = run_reddit_growing_discovery(
-                db, limit=limit_per_adapter, dry_run=dry_run
-            )
         else:
-            raise ValueError(f"unknown adapter: {adapter}")
+            try:
+                if adapter == "general_feed":
+                    summary = run_general_feed_discovery(
+                        db, limit=limit_per_adapter, model=model,
+                        dry_run=dry_run, no_claude=no_claude,
+                    )
+                elif adapter == "google_related":
+                    summary = run_google_related_discovery(
+                        db, limit=limit_per_adapter, dry_run=dry_run
+                    )
+                elif adapter == "tiktok":
+                    summary = run_tiktok_creative_discovery(
+                        db, limit=limit_per_adapter, dry_run=dry_run
+                    )
+                elif adapter == "reddit_growing":
+                    summary = run_reddit_growing_discovery(
+                        db, limit=limit_per_adapter, dry_run=dry_run
+                    )
+                else:
+                    raise ValueError(f"unknown adapter: {adapter}")
+                if summary is None:
+                    raise RuntimeError("adapter returned no summary")
+                summary.setdefault("adapter_status", "ok")
+            except Exception as exc:
+                summary = adapter_failure_summary(exc)
+                print(
+                    f"discover.{adapter}: FAIL {type(exc).__name__}: {str(exc)[:300]}",
+                    file=sys.stderr,
+                )
         summaries[adapter] = summary
-        if summary is None:
-            return None
+    print_discovery_run_summary(summaries)
     return summaries
 
 
@@ -2009,6 +2277,8 @@ def main():
                     help="Backward-compatible alias for --limit-per-adapter")
     ap.add_argument("--model", default="sonnet",
                     help="Claude model for discovery prompt")
+    ap.add_argument("--no-claude", action="store_true",
+                    help="Do not invoke Claude; use heuristic general-feed fallback")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print proposals without writing to db")
     ap.add_argument("--list-pending", action="store_true",
@@ -2056,8 +2326,9 @@ def main():
         summaries = run_discovery_adapters(
             db, adapters, limit_per_adapter=limit_per_adapter,
             model=args.model, dry_run=args.dry_run,
+            no_claude=args.no_claude,
         )
-        return 0 if summaries is not None else 2
+        return discovery_run_exit_code(summaries)
     if args.list_pending:
         list_pending(db)
         return 0

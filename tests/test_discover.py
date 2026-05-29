@@ -58,6 +58,28 @@ def _add_candidate_with_trends(db, slug="padel", display_name="Padel", category=
     return cid
 
 
+def _add_general_feed_fetch(db, raw_text, label="Well+Good",
+                            url="https://example.com/feed"):
+    cid = db.execute(
+        "SELECT id FROM candidates WHERE slug=?",
+        ("__general__",),
+    ).fetchone()[0]
+    db.execute(
+        "INSERT INTO sources (candidate_id, source_type, url, label) VALUES (?,?,?,?)",
+        (cid, "general_feed", url, label),
+    )
+    sid = db.execute(
+        "SELECT id FROM sources WHERE candidate_id=? AND url=?",
+        (cid, url),
+    ).fetchone()[0]
+    cur = db.execute(
+        "INSERT INTO fetches (source_id, fetched_at, raw_text) VALUES (?,?,?)",
+        (sid, "2026-05-29 12:00:00", raw_text),
+    )
+    db.commit()
+    return cur.lastrowid
+
+
 class FakeGoogleProvider:
     def __init__(self, rising):
         self.rising = rising
@@ -220,6 +242,102 @@ class ProviderStateTests(unittest.TestCase):
 
             provider_cls.assert_not_called()
             self.assertEqual(summaries["tiktok"]["provider_skipped"], 1)
+
+
+class DiscoveryRunnerResilienceTests(unittest.TestCase):
+    def test_runner_continues_after_adapter_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _init_db(os.path.join(tmp, "db.sqlite"))
+            discover.ensure_discovery_schema(db)
+
+            ok_summary = {
+                "proposals_new": 1,
+                "proposals_bumped": 0,
+                "evidence_rows": 1,
+            }
+            with mock.patch(
+                "discover.run_general_feed_discovery",
+                side_effect=RuntimeError("claude adapter exploded"),
+            ), mock.patch(
+                "discover.run_google_related_discovery",
+                return_value=ok_summary,
+            ):
+                summaries = discover.run_discovery_adapters(
+                    db,
+                    ["general_feed", "google_related"],
+                    limit_per_adapter=5,
+                    dry_run=True,
+                )
+
+            self.assertEqual(summaries["general_feed"]["adapter_status"], "failed")
+            self.assertEqual(summaries["general_feed"]["error_type"], "RuntimeError")
+            self.assertEqual(summaries["google_related"]["adapter_status"], "ok")
+            self.assertEqual(discover.discovery_run_exit_code(summaries), 0)
+
+    def test_runner_exits_nonzero_when_every_adapter_failed(self):
+        summaries = {
+            "general_feed": discover.adapter_failure_summary(RuntimeError("a")),
+            "google_related": discover.adapter_failure_summary(RuntimeError("b")),
+        }
+        self.assertEqual(discover.discovery_run_exit_code(summaries), 2)
+
+
+class GeneralFeedFallbackTests(unittest.TestCase):
+    def test_no_claude_uses_heuristic_without_invoking_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _init_db(os.path.join(tmp, "db.sqlite"))
+            discover.ensure_discovery_schema(db)
+            _add_general_feed_fetch(
+                db,
+                "TITLE: Creatine Gummies Are Taking Over Menopause Wellness "
+                "DATE: 2026-05-29 "
+                "DESC: Women are buying creatine supplements for midlife strength.",
+            )
+
+            with mock.patch("discover.run_claude") as run_claude:
+                summary = discover.run_general_feed_discovery(
+                    db,
+                    limit=5,
+                    dry_run=False,
+                    no_claude=True,
+                )
+
+            run_claude.assert_not_called()
+            self.assertEqual(summary["fetches_heuristic"], 1)
+            self.assertEqual(summary["proposals_new"], 1)
+            row = db.execute(
+                "SELECT canonical_slug, display_name FROM proposed_candidates"
+            ).fetchone()
+            self.assertEqual(row[0], "creatine_gummies")
+            self.assertEqual(row[1], "Creatine Gummies")
+
+    def test_claude_auth_failure_falls_back_for_remaining_fetches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _init_db(os.path.join(tmp, "db.sqlite"))
+            discover.ensure_discovery_schema(db)
+            raw = (
+                "TITLE: Phone-Free Running Clubs DATE: 2026-05-29 "
+                "DESC: Community running groups are marketing social wellness."
+            )
+            _add_general_feed_fetch(db, raw, label="Feed A", url="https://a.example/feed")
+            _add_general_feed_fetch(db, raw, label="Feed B", url="https://b.example/feed")
+
+            with mock.patch(
+                "discover.run_claude",
+                side_effect=discover.AuthError("claude auth failed"),
+            ) as run_claude:
+                summary = discover.run_general_feed_discovery(
+                    db,
+                    limit=5,
+                    dry_run=False,
+                    no_claude=False,
+                )
+
+            self.assertEqual(run_claude.call_count, 1)
+            self.assertEqual(summary["claude_auth_failures"], 1)
+            self.assertEqual(summary["fetches_heuristic"], 2)
+            self.assertEqual(summary["proposals_new"], 1)
+            self.assertEqual(summary["skipped_existing"], 1)
 
 
 class SlugNormalizationTests(unittest.TestCase):
