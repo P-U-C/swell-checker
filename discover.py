@@ -414,8 +414,14 @@ class ProviderState:
 
 
 def run_claude(prompt_text: str, model: str = "sonnet", timeout: int = 300) -> str:
+    # --strict-mcp-config: with no --mcp-config supplied, this tells claude to use
+    # ZERO MCP servers, so a headless discovery call does NOT load enabled plugins
+    # (notably the Telegram bot plugin). Without it, every discovery `claude -p`
+    # spins up a competing Telegram getUpdates listener that fights the operator's
+    # live bot poller (one consumer per token) and drops their inbound messages.
     result = subprocess.run(
-        ["claude", "-p", prompt_text, "--model", model, "--output-format", "text"],
+        ["claude", "-p", prompt_text, "--model", model,
+         "--output-format", "text", "--strict-mcp-config"],
         capture_output=True, text=True, timeout=timeout,
     )
     if result.returncode != 0:
