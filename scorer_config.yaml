@@ -1,34 +1,47 @@
 # swell-checker scorer config
-# Tune these, re-run scorer.py, iterate.
+# Tune these, re-run scorer.py + calibration.py, iterate.
+#
+# Redesigned 2026-06-12. The old design saturated BOTH main signals to 1.0
+# for every candidate (velocity on raw Reddit mention counts, spread on
+# summed daily Places snapshots), so the composite discriminated on almost
+# nothing and calibration failed (axe_throwing/crossfit scored as winners).
+# Calibration after redesign: pickleball 0.665 / hyrox 0.700 (>=0.60) vs
+# crossfit 0.111 / axe_throwing 0.306 (<=0.40); verdicts hold under +/-20%
+# on every constant below.
 
 velocity_window_months: 18
 spread_window_months: 24
-velocity_saturation: 15.0
-spread_saturation: 8.0
+velocity_saturation: 25.0
 
+# Spread = real deployment expansion: max(census growth, geographic events).
+#  - census_growth_ref: %-growth of OPERATIONAL_BUSINESSES (parsed from the
+#    Places operator payload) across the spread window that saturates the
+#    sub-signal. 0.10 = +10% footprint growth -> 1.0.
+#  - geo_saturation: count of geographic (new-metro) events that saturates.
+#    Carries metro-saturated-but-expanding trends (hyrox) whose top-20-metro
+#    Places census is at its coverage ceiling.
+census_growth_ref: 0.10
+geo_saturation: 14.0
+
+# Rebalanced: spread's data proxy (fixed top-20-metro Places sample)
+# undercounts metro-saturated winners, so it no longer dominates.
 weights:
-  # Spread (operator/geographic deployment) is the dominant signal for
-  # "crossing the chasm". Reddit chatter alone saturates velocity but
-  # doesn't mean adoption -- axe_throwing has plenty of fizzled chatter,
-  # the difference vs pickleball is whether NEW LOCATIONS are opening.
-  velocity: 0.25
-  spread: 0.55
+  velocity: 0.45
+  spread: 0.35
   vocabulary: 0.20
 
-# Per-event-type weights inside the velocity bucket. "mention" is weak
-# (people talking), "cohort"/"funding" is strong (capital + group
-# adoption). With these weights, only trends with diverse high-signal
-# events saturate the velocity bucket.
+# Per-event-type weights inside the velocity bucket. mention (Reddit
+# chatter) is ZERO -- 300+ mentions saturated velocity for every candidate
+# including fizzled ones. Capital + group adoption (funding/cohort) and
+# earned media are the signal.
 velocity_type_weights:
-  mention: 0.30
+  mention: 0.0
   media: 1.0
   cohort: 2.0
   funding: 5.0
-  adjacent: 0.5
+  adjacent: 0.3
 
 # Disruption events (trend reversals / failures) dampen the composite.
-# Coefficient bumped from 0.05 → 0.08 so chatter-heavy fizzled trends
-# (axe_throwing) drop below the calibration_fizzled cap of 0.40.
 disruption_coefficient: 0.08
 disruption_cap: 0.30
 

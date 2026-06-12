@@ -2,15 +2,16 @@
 """
 scorer.py - live scoring for swell-checker candidates.
 
-Same three-signal architecture as the backtest scorer:
-  - velocity (mention/media/cohort/participant/adjacent/funding events, log-scaled in trailing window)
-  - spread (operator + geographic events, log-scaled in trailing window)
+Three-signal architecture (redesigned 2026-06-12 -- see scorer_config.yaml):
+  - velocity (media/cohort/funding/adjacent events, type-weighted, in trailing window; mention weighted 0)
+  - spread (deployment expansion: max of Places-census growth and geographic new-metro events)
   - vocabulary (positive/negative vocabulary events, all-time)
   - disruption penalty (damping)
 
 Reads events from the db, writes/upserts snapshots to the scores table.
 """
 import os
+import re
 import sys
 import math
 import yaml
@@ -26,24 +27,36 @@ CFG_PATH = os.path.join(HERE, "scorer_config.yaml")
 DEFAULT_CONFIG = {
     "velocity_window_months": 18,
     "spread_window_months": 24,
-    "velocity_saturation": 15.0,
-    "spread_saturation": 8.0,
-    # Composite weights -- spread (operator/geographic deployment) is the
-    # strongest signal for "crossing the chasm". Reddit chatter alone
-    # (mention/adjacent) saturates velocity but doesn't mean a trend is
-    # being adopted -- axe_throwing has plenty of fizzled chatter, the
-    # difference is whether NEW LOCATIONS are opening.
-    "weights": {"velocity": 0.25, "spread": 0.55, "vocabulary": 0.20},
-    # Per-event-type weights inside the velocity bucket. "mention" is
-    # weak (people talking), "cohort"/"funding" is strong (capital +
-    # group adoption). Saturation stays at 15 so trends with diverse
-    # high-signal events still saturate.
+    "velocity_saturation": 25.0,
+    # Spread = real deployment expansion, the max of two sub-signals:
+    #   census growth -- %-growth of OPERATIONAL_BUSINESSES (parsed from
+    #   Places operator payloads) across the spread window; 10% growth
+    #   saturates. Summing daily snapshots (the pre-2026-06-12 design)
+    #   pinned spread to 1.0 for every candidate because Places re-reports
+    #   the whole footprint each day.
+    #   geographic expansion -- count of distinct geographic events
+    #   (new-metro entries); 14 saturates. This is what carries a trend
+    #   like hyrox whose top-20-metro census is already saturated (the
+    #   Places sample has a coverage ceiling) but which keeps entering
+    #   new metros.
+    "census_growth_ref": 0.10,
+    "geo_saturation": 14.0,
+    # Composite weights -- rebalanced 2026-06-12. Spread's data proxy
+    # (top-20-metro Places sample) undercounts metro-saturated winners,
+    # so it can no longer dominate; velocity (now chatter-proof, see
+    # below) carries the most weight.
+    "weights": {"velocity": 0.45, "spread": 0.35, "vocabulary": 0.20},
+    # Per-event-type weights inside the velocity bucket. "mention"
+    # (Reddit chatter) is ZERO -- 300+ mentions saturated velocity for
+    # every candidate including fizzled ones, so chatter can no longer
+    # fake momentum. Capital + group adoption (funding/cohort) and
+    # earned media are the signal.
     "velocity_type_weights": {
-        "mention": 0.30,
+        "mention": 0.0,
         "media": 1.0,
         "cohort": 2.0,
         "funding": 5.0,
-        "adjacent": 0.5,
+        "adjacent": 0.3,
     },
     "threshold": 0.55,
 }
@@ -68,34 +81,64 @@ def velocity_score(events, saturation, type_weights=None):
     """Per-event-type weighted velocity.
 
     Reddit chatter ("mention") dominates raw event counts but is the
-    weakest signal of real adoption. Capital deployment ("cohort" /
-    "funding") is the strongest. Without type weights, all mention-
-    heavy trends saturate velocity at 1.0 regardless of whether
-    they're actually crossing the chasm. With type weights, only
-    trends with diverse high-signal events saturate.
+    weakest signal of real adoption -- with mention weighted 0 it cannot
+    drive velocity at all. Capital deployment ("cohort"/"funding") and
+    earned media are what saturate the bucket.
     """
     weighted = 0.0
-    for etype, mag, _date in events:
+    for etype, mag, _date, _quote in events:
         if etype in VELOCITY_TYPES:
-            base = abs(mag) if mag < 10 else 1.0 + math.log10(abs(mag))
+            base = abs(mag) if abs(mag) < 10 else 1.0 + math.log10(abs(mag))
             tw = (type_weights or {}).get(etype, 1.0)
             weighted += base * tw
     return min(1.0, weighted / saturation)
 
 
-def spread_score(events, saturation):
-    s = 0.0
-    for etype, mag, _date in events:
-        if etype == "geographic":
-            s += abs(mag)
-        elif etype == "operator":
-            s += 1.0 + math.log10(max(1, abs(mag)))
-    return min(1.0, s / saturation)
+def census_growth_score(events, ref):
+    """Footprint growth from Places operator payloads.
+
+    Each operator snapshot carries an OPERATIONAL_BUSINESSES census of the
+    sampled metros. Growth of that census across the window (first day vs
+    last day, max per day) is the deployment signal; `ref` growth (e.g.
+    0.10 = +10%) saturates. Counting or summing the snapshots themselves
+    is meaningless -- Places re-reports the whole footprint daily.
+    """
+    by_day = {}
+    for etype, _mag, date, quote in events:
+        if etype == "operator" and quote and "OPERATIONAL_BUSINESSES" in quote:
+            m = re.search(r"OPERATIONAL_BUSINESSES:\s*(\d+)", quote)
+            if m:
+                key = date.strftime("%Y-%m-%d")
+                by_day[key] = max(by_day.get(key, 0), int(m.group(1)))
+    if len(by_day) < 2:
+        return 0.0
+    series = [count for _day, count in sorted(by_day.items())]
+    growth = (series[-1] - series[0]) / max(1, series[0])
+    return max(0.0, min(1.0, growth / ref))
+
+
+def geo_expansion_score(events, saturation):
+    n = sum(1 for etype, _mag, _date, _quote in events if etype == "geographic")
+    return min(1.0, n / saturation)
+
+
+def spread_score(events, census_ref, geo_saturation):
+    """Real deployment expansion: max(census growth, new-metro entries).
+
+    max, not sum: the Places census has a coverage ceiling (fixed top-20
+    metro sample), so a metro-saturated but genuinely expanding trend
+    (hyrox) shows flat census while racking up geographic events --
+    either sub-signal alone is sufficient evidence of spread.
+    """
+    return max(
+        census_growth_score(events, census_ref),
+        geo_expansion_score(events, geo_saturation),
+    )
 
 
 def vocab_score(events):
     positive, negative = 0.0, 0.0
-    for etype, mag, _date in events:
+    for etype, mag, _date, _quote in events:
         if etype == "vocabulary":
             if mag > 0:
                 positive += mag
@@ -107,14 +150,11 @@ def vocab_score(events):
 def disruption_penalty(events, coefficient=0.08, cap=0.30):
     """Penalty for disruption events (trend reversals / failures).
 
-    Bumped from 0.05 → 0.08 so that mention-heavy fizzled trends
-    (axe_throwing has 27 chatter mentions + 3 small disruptions)
-    get damped below the calibration cap rather than scoring 0.42.
     Cap stays at 0.30 so a single bad year doesn't kill a trend
-    with otherwise strong operator signals.
+    with otherwise strong deployment signals.
     """
     p = 0.0
-    for etype, mag, _date in events:
+    for etype, mag, _date, _quote in events:
         if etype == "disruption" and mag < 0:
             p += abs(mag) * coefficient
     return min(cap, p)
@@ -125,16 +165,16 @@ def score_candidate(db, candidate_id, as_of, cfg):
     spread_start = as_of - timedelta(days=30 * cfg["spread_window_months"])
 
     all_events = db.execute(
-        "SELECT event_type, magnitude, event_date FROM events WHERE candidate_id=? AND event_date<=?",
+        "SELECT event_type, magnitude, event_date, evidence_quote FROM events WHERE candidate_id=? AND event_date<=?",
         (candidate_id, as_of.strftime("%Y-%m-%d")),
     ).fetchall()
-    all_events = [(t, m, datetime.strptime(d, "%Y-%m-%d")) for t, m, d in all_events]
+    all_events = [(t, m, datetime.strptime(d, "%Y-%m-%d"), q) for t, m, d, q in all_events]
 
     vel_events = [e for e in all_events if e[2] >= vel_start]
     spread_events = [e for e in all_events if e[2] >= spread_start]
 
     vel = velocity_score(vel_events, cfg["velocity_saturation"], cfg.get("velocity_type_weights"))
-    spread = spread_score(spread_events, cfg["spread_saturation"])
+    spread = spread_score(spread_events, cfg["census_growth_ref"], cfg["geo_saturation"])
     vocab = vocab_score(all_events)
     penalty = disruption_penalty(
         vel_events,
