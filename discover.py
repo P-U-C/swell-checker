@@ -2133,6 +2133,110 @@ def list_pending(db):
               f"{(category or '')[:18]:<18s} {support:>4d}  {last_short}")
 
 
+def _candidate_corroboration(db, candidate_id, window_days=30):
+    """Summarise the independent source TYPES backing a tracked candidate over the
+    recent window. Returns (source_type_count, detail_dict). A trend that fires on
+    Places geo-density AND Google Trends velocity is two independent source types;
+    that is the corroboration Foreshore's thesis demands ("weak signals across
+    *disconnected* sources — confirm or kill"). Single-feed editorial scrapes never
+    reach this path — only scored, would_fire tracked candidates do."""
+    rows = db.execute(
+        """SELECT COALESCE(s.label, s.url) AS lbl, COUNT(*) AS n
+           FROM events e
+           JOIN fetches f ON e.fetch_id = f.id
+           JOIN sources s ON f.source_id = s.id
+           WHERE e.candidate_id = ?
+             AND e.event_date >= date('now', ?)
+           GROUP BY lbl""",
+        (candidate_id, f"-{int(window_days)} day"),
+    ).fetchall()
+    detail = {"places": 0, "trends": 0, "reddit": 0, "other": 0}
+    for lbl, n in rows:
+        low = (lbl or "").lower()
+        if low.startswith("places"):
+            detail["places"] += n
+        elif "trends" in low:
+            detail["trends"] += n
+        elif low.startswith("r/") or "reddit" in low:
+            detail["reddit"] += n
+        else:
+            detail["other"] += n
+    source_types = sum(1 for k in ("places", "trends", "reddit") if detail[k] > 0)
+    if detail["other"]:
+        source_types += 1
+    return source_types, detail
+
+
+def _ready_evidence_quote(name, stage, comp, detail):
+    """Synthesize a rich, multi-source seed sentence for the editorial writer —
+    geo-density + search-velocity, not a single magazine line."""
+    parts = []
+    if detail["places"]:
+        parts.append(f"{detail['places']} venues mapped across Metro Vancouver (Places)")
+    if detail["trends"]:
+        parts.append("rising Google Trends search velocity")
+    if detail["reddit"]:
+        parts.append("community subscriber growth (Reddit)")
+    if detail["other"]:
+        parts.append("editorial/culture-feed mentions")
+    corroboration = "; ".join(parts) if parts else "scorer composite"
+    return (
+        f"Tracked trend '{name}' is firing (stage: {stage}, composite {comp:.2f}). "
+        f"Corroborated across {corroboration}."
+    )
+
+
+def list_ready(db, limit=None, min_composite=0.0, exclude_slugs=None):
+    """Emit the scored, would_fire tracked-candidate portfolio as a JSON array that
+    editorial's source_to_issue.parse_pending_output consumes directly. This is the
+    corroborated signal vein — the product's actual value — as opposed to raw
+    single-mention discoveries surfaced by --list-pending."""
+    exclude = {s.strip().lower() for s in (exclude_slugs or []) if s and s.strip()}
+    rows = db.execute(
+        """SELECT c.id, c.slug, c.display_name, c.category, c.stage,
+                  s.composite, s.velocity, s.spread, s.vocabulary, s.as_of
+           FROM candidates c
+           JOIN scores s ON s.candidate_id = c.id
+           WHERE s.as_of = (SELECT MAX(s2.as_of) FROM scores s2 WHERE s2.candidate_id = c.id)
+             AND s.would_fire = 1
+             AND c.status IN ('tracking', 'observing', 'promoted')
+           ORDER BY s.composite DESC, c.slug"""
+    ).fetchall()
+    out = []
+    for cid, slug, name, category, stage, comp, vel, spread, vocab, as_of in rows:
+        if comp < min_composite:
+            continue
+        if slug and slug.lower() in exclude:
+            continue
+        src_types, detail = _candidate_corroboration(db, cid)
+        out.append({
+            "id": f"cand-{cid}",
+            "slug": slug,
+            "display_name": name,
+            "category": category or "wellness_trend",
+            "source_url": f"https://pft.permanentupperclass.com/swell/#{slug}",
+            "evidence_quote": _ready_evidence_quote(name, stage, comp, detail),
+            "confidence": round(float(comp), 3),
+            "last_seen_at": str(as_of),
+            "support_count": src_types,
+            "stage": stage,
+            "signal_breakdown": {
+                "composite": round(float(comp), 3),
+                "velocity": round(float(vel), 3),
+                "spread": round(float(spread), 3),
+                "vocabulary": round(float(vocab), 3),
+                "source_types": src_types,
+                "places_records": detail["places"],
+                "trends_records": detail["trends"],
+                "reddit_records": detail["reddit"],
+            },
+        })
+        if limit is not None and len(out) >= limit:
+            break
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def show_proposal(db, proposal_id):
     row = db.execute(
         """SELECT id, canonical_slug, display_name, category, machine_explanation,
@@ -2287,6 +2391,16 @@ def main():
                     help="Do not invoke Claude; use heuristic general-feed fallback")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print proposals without writing to db")
+    ap.add_argument("--list-ready", action="store_true",
+                    help="Emit scored, would_fire tracked candidates as JSON "
+                         "(the corroborated portfolio editorial draws from)")
+    ap.add_argument("--ready-limit", type=int, default=None,
+                    help="Cap --list-ready output to N candidates")
+    ap.add_argument("--ready-min-composite", type=float, default=0.0,
+                    help="Drop --list-ready candidates below this composite score")
+    ap.add_argument("--ready-exclude", default=None,
+                    help="Comma-separated slugs to exclude from --list-ready "
+                         "(recently-published trends, for dedup)")
     ap.add_argument("--list-pending", action="store_true",
                     help="List pending_approval proposals")
     ap.add_argument("--show", type=int, default=None,
@@ -2310,13 +2424,13 @@ def main():
         print(f"FAIL: db not found: {args.db}", file=sys.stderr)
         return 1
 
-    actions = [args.run, args.list_pending, args.show is not None,
+    actions = [args.run, args.list_pending, args.list_ready, args.show is not None,
                args.approve is not None, args.reject is not None,
                args.promote is not None, args.provider_status,
                args.provider_reset is not None]
     if sum(bool(a) for a in actions) != 1:
-        ap.error("specify exactly one of --run / --list-pending / --show / "
-                 "--approve / --reject / --promote / --provider-status / "
+        ap.error("specify exactly one of --run / --list-pending / --list-ready / "
+                 "--show / --approve / --reject / --promote / --provider-status / "
                  "--provider-reset")
 
     db = sqlite3.connect(args.db)
@@ -2338,6 +2452,11 @@ def main():
     if args.list_pending:
         list_pending(db)
         return 0
+    if args.list_ready:
+        exclude = (args.ready_exclude or "").split(",") if args.ready_exclude else []
+        return list_ready(db, limit=args.ready_limit,
+                          min_composite=args.ready_min_composite,
+                          exclude_slugs=exclude)
     if args.show is not None:
         return show_proposal(db, args.show)
     if args.approve is not None:
